@@ -3,7 +3,7 @@
   "version": "1.0.0",
   "preferGlobal": true,
   "bin": {
-    "hulud-scanner": "./scan.js"
+    "hulud-party-scanner": "./scan.js"
   },
   "description": "Project integrity scanner for known vulnerabilities and suspicious patterns related to the Shai-Hulud supply-chain attack.",
   "main": "scan.js",
