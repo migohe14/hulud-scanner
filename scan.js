@@ -5,7 +5,7 @@ const path = require('path');
 const crypto = require('crypto');
  
 // --- Configuration ---
-const COMPROMISED_LIST_URL = "";
+const COMPROMISED_LIST_URL = "https://raw.githubusercontent.com/migohe14/hulud-scanner/refs/heads/main/compromised-libs.txt";
 const MALICIOUS_HASH = "46faab8ab153fae6e80e7cca38eab363075bb524edd79e42269217a083628f09";
 
 // --- Console Colors ---
