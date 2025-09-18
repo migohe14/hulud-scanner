@@ -149,7 +149,19 @@ function scanForMaliciousFiles(directory) {
 async function main() {
     try {
         // Use the provided path or the current directory.
-        const targetPath = process.argv[2] || '.';
+        // This handles arguments like `npx tool .` or `npx tool -- /path/to/project`
+        const args = process.argv.slice(2);
+        const doubleDashIndex = args.indexOf('--');
+        
+        let targetArg;
+        if (doubleDashIndex !== -1) {
+            // If '--' is present, the path is the argument right after it.
+            targetArg = args[doubleDashIndex + 1];
+        } else {
+            // Otherwise, it's the first argument.
+            targetArg = args[0];
+        }
+        const targetPath = targetArg || '.';
         const projectRoot = path.resolve(targetPath);
 
         if (!fs.existsSync(projectRoot) || !fs.statSync(projectRoot).isDirectory()) {
