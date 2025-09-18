@@ -1,1 +1,1 @@
-# hulud-scanner
+Project integrity scanner for known vulnerabilities and suspicious patterns related to the Shai-Hulud supply-chain attack.
