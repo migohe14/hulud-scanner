@@ -1,7 +1,6 @@
 {
   "name": "hulud-party-scanner",
   "version": "1.0.2",
-  "preferGlobal": true,
   "bin": {
     "hulud-party-scanner": "./scan.js"
   },

@@ -6,10 +6,15 @@ This project is a Node.js implementation based on the original shell script from
 
 ## Usage
 
-To scan a project, run the following command in your terminal. You can target a specific directory or run it in your current directory.
+You can run the scanner against your current project directory, or specify a path to another one.
 
+To scan the current directory:
+
+```bash
+npx hulud-party-scanner
+```
+
+To scan a specific directory:
 ```bash
 npx hulud-party-scanner "/path/to/your/project"
 ```
-
-Si no se especifica una ruta, el escáner se ejecutará en el directorio actual.
