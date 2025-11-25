@@ -6,7 +6,7 @@ const crypto = require('crypto');
 const { execSync } = require('child_process');
 
 // --- Configuration ---
-const COMPROMISED_LIST_URL = "./compromised-libs.txt";
+const COMPROMISED_LIST_URL = "https://raw.githubusercontent.com/migohe14/hulud-scanner/refs/heads/main/compromised-libs.txt";
 const MALICIOUS_HASHES = new Set([
     "46faab8ab153fae6e80e7cca38eab363075bb524edd79e42269217a083628f09",
     "de0e25a3e6c1e1e5998b306b7141b3dc4c0088da9d7bb47c1c00c91e6e4f85d6",
