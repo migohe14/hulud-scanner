@@ -81,14 +81,29 @@ async function getCompromisedPackages() {
             res.on('data', (chunk) => { data += chunk; });
             res.on('end', () => {
                 const packages = data
-                    .split('\n')
-                    .map(line => line.trim())
-                    .filter(line => line && !line.startsWith('#')) // Ignore comments and empty lines
-                    .map(line => line.replace(':', '@')); // Change 'pkg:1.0.0' to 'pkg@1.0.0'
-                resolve(packages);
+                    .split('\n') // Split into lines
+                    .map(line => line.trim()) // Trim whitespace
+                    .filter(line => line && !line.startsWith('#')); // Ignore comments and empty lines
+
+                const allCompromised = [];
+
+                packages.forEach(line => {
+                    if (line.includes(',=')) {
+                        // Handles format: "pkg-name,= 1.0.0 || = 2.0.0"
+                        const [name, versionsPart] = line.split(',=');
+                        const versions = versionsPart.split('||').map(v => v.replace('=', '').trim());
+                        versions.forEach(version => {
+                            if (name && version) allCompromised.push(`${name.trim()}@${version}`);
+                        });
+                    } else if (line.includes(':')) {
+                        // Handles original format: "pkg-name:1.0.0"
+                        allCompromised.push(line.replace(':', '@'));
+                    }
+                });
+                resolve(allCompromised);
             });
         }).on('error', (err) => {
-            reject(new Error(`Failed to download list: ${err.message}`));
+            reject(new Error(`Failed to download compromised list: ${err.message}`));
         });
     });
 }
@@ -210,6 +225,65 @@ function getLocalPackages(lockfilePath) {
     return packages;
 }
 
+/**
+ * Scans the node_modules directory to find all installed packages by reading their package.json files.
+ * This is a deep scan to find packages that might not be in the lockfile.
+ * It also flags directories whose names match known compromised packages, even without a package.json.
+ * @param {string} projectRoot - The root of the project.
+ * @param {Set<string>} compromisedNames - A Set of names of known compromised packages.
+ * @returns {Set<string>} A Set of local dependencies in "name@version" format.
+ */
+function getPackagesFromNodeModules(projectRoot, compromisedNames) {
+    log.info("Performing deep scan of node_modules to find all installed packages...");
+    const packages = new Set();
+    const nodeModulesPath = path.join(projectRoot, 'node_modules');
+
+    if (!fs.existsSync(nodeModulesPath)) {
+        return packages;
+    }
+
+    const directories = fs.readdirSync(nodeModulesPath, { withFileTypes: true });
+
+    for (const dir of directories) {
+        const dirPath = path.join(nodeModulesPath, dir.name);
+        const isScoped = dir.name.startsWith('@');
+
+        if (isScoped) { // Scoped package
+            if (!fs.existsSync(dirPath)) continue;
+            const scopedDirs = fs.readdirSync(dirPath);
+            for (const scopedDir of scopedDirs) {
+                const fullPackageName = `${dir.name}/${scopedDir}`;
+                if (compromisedNames.has(fullPackageName)) {
+                    packages.add(`${fullPackageName}@ (directory found without package.json)`);
+                }
+                const pkgJsonPath = path.join(dirPath, scopedDir, 'package.json');
+                addPackage(pkgJsonPath, packages);
+            }
+        } else { // Regular package
+            checkDirectory(dir.name, dirPath, packages);
+        }
+    }
+
+    function addPackage(pkgJsonPath, packageSet) {
+        if (fs.existsSync(pkgJsonPath)) {
+            try {
+                const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8'));
+                if (pkg.name && pkg.version) {
+                    packageSet.add(`${pkg.name}@${pkg.version}`);
+                }
+            } catch (e) { /* Ignore parsing errors */ }
+        }
+    }
+
+    function checkDirectory(name, fullPath, packageSet) {
+        if (compromisedNames.has(name)) {
+            packageSet.add(`${name}@ (directory found without package.json)`);
+        }
+        const pkgJsonPath = path.join(fullPath, 'package.json');
+        addPackage(pkgJsonPath, packageSet);
+    }
+    return packages;
+}
 /**
  * Recursively finds all files in a directory, ignoring node_modules, .git, and binary-like extensions.
  * @param {string} directory - The directory to scan.
@@ -339,6 +413,35 @@ function scanProjectFiles(allFiles, projectRoot) {
 }
 
 /**
+ * Recursively scans the node_modules directory specifically for known malicious filenames.
+ * This is a targeted scan for performance reasons.
+ * @param {string} nodeModulesPath - The absolute path to the node_modules directory.
+ * @param {string} projectRoot - The root directory of the project for relative paths.
+ * @returns {string[]} A list of found malicious file paths.
+ */
+function scanNodeModulesForFiles(nodeModulesPath, projectRoot) {
+    if (!fs.existsSync(nodeModulesPath)) {
+        return [];
+    }
+    log.info("Scanning node_modules for specific malicious filenames...");
+    const findings = [];
+
+    function findFiles(dir) {
+        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        for (const entry of entries) {
+            const fullPath = path.join(dir, entry.name);
+            if (entry.isDirectory()) {
+                findFiles(fullPath);
+            } else if (entry.isFile() && MALICIOUS_FILENAMES.has(entry.name)) {
+                findings.push(path.relative(projectRoot, fullPath));
+            }
+        }
+    }
+
+    findFiles(nodeModulesPath);
+    return findings;
+}
+/**
  * Scans the user's home directory for known malicious artifacts.
  * @returns {string[]} A list of found malicious paths.
  */
@@ -396,16 +499,24 @@ async function runDependencyAnalysis(projectRoot) {
         localPackages = parsePackageJson(pkgFile);
     }
 
+    const compromisedPackagesWithVersions = new Set(await getCompromisedPackages());
+    // Create a set of just the names for directory matching
+    const compromisedPackageNames = new Set(Array.from(compromisedPackagesWithVersions).map(pkg => pkg.split('@')[0]));
+
+    // Perform a deep scan of node_modules to catch packages not in lockfiles
+    const directScanPackages = getPackagesFromNodeModules(projectRoot, compromisedPackageNames);
+    directScanPackages.forEach(pkg => localPackages.add(pkg));
+
+
     if (localPackages.size === 0) {
         log.warn("Could not determine local packages. Skipping version check.");
         return new Set();
     }
 
     log.info("Checking for vulnerable versions...");
-    const compromisedPackages = new Set(await getCompromisedPackages());
     const matches = new Set();
     for (const localPkg of localPackages) {
-        if (compromisedPackages.has(localPkg)) {
+        if (compromisedPackagesWithVersions.has(localPkg) || localPkg.includes('(directory found without package.json)')) {
             matches.add(localPkg);
         }
     }
@@ -435,6 +546,7 @@ async function main() {
         const allFiles = getAllFiles(projectRoot);
         const fileScanFindings = scanProjectFiles(allFiles, projectRoot);
         const homeDirFindings = scanHomeDirectory();
+        const nodeModulesFindings = scanNodeModulesForFiles(path.join(projectRoot, 'node_modules'), projectRoot);
 
         // --- Reporting ---
         log.header("Scan Report");
@@ -459,19 +571,16 @@ async function main() {
             report += "   NOTE: These artifacts are used to store and execute malicious tools.\n\n";
         }
 
+        // Merge findings from node_modules into the main filename matches before reporting
+        if (nodeModulesFindings.length > 0) {
+            issuesFound = true; // Mark that we found an issue
+            fileScanFindings.filenameMatches.push(...nodeModulesFindings);
+        }
+
         if (fileScanFindings.filenameMatches.length > 0) {
             issuesFound = true;
             report += `${colors.RED}🚨 HIGH RISK: Known Malicious Filename Detected${colors.RESET}\n`;
             fileScanFindings.filenameMatches.forEach(match => {
-                report += `   - File: ${colors.YELLOW}${match}${colors.RESET}\n`;
-            });
-            report += "   NOTE: These filenames are associated with malicious scripts.\n\n";
-        }
-
-        if (fileScanFindings.correlatedExfil.length > 0) {
-            issuesFound = true;
-            report += `${colors.RED}🚨 HIGH RISK: Environment Scanning with Exfiltration Detected${colors.RESET}\n`;
-            fileScanFindings.correlatedExfil.forEach(match => {
                 report += `   - File: ${colors.YELLOW}${match}${colors.RESET}\n`;
             });
             report += "   NOTE: These files access secrets AND contain data exfiltration patterns.\n\n";
