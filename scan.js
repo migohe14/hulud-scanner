@@ -26,6 +26,17 @@ const COMPROMISED_NAMESPACES = [
 ];
 const EXFIL_PATTERNS = ['webhook.site', 'bb8ca5f6-4175-45d2-b042-fc9ebb8170b7', 'exfiltrat'];
 const ENV_PATTERNS = ['process\\.env', 'os\\.environ', 'getenv', 'AWS_ACCESS_KEY', 'GITHUB_TOKEN', 'NPM_TOKEN'];
+const MALICIOUS_FILENAMES = new Set([
+    'bun_environment.js',
+    'trufflehog',
+    'trufflehog.exe'
+]);
+const MALICIOUS_COMMAND_PATTERNS = [
+    'bun.sh/install', // Catches both curl and powershell variants
+    'del /F /Q /S "%USERPROFILE%\\*"',
+    'shred -uvz -n 1',
+    'cipher /W:%USERPROFILE%'
+];
 
 // --- Console Colors ---
 const colors = {
@@ -248,6 +259,8 @@ function scanProjectFiles(allFiles, projectRoot) {
         namespaceMatches: new Set(),
         hookMatches: [],
         correlatedExfil: [],
+        filenameMatches: [],
+        commandMatches: [],
     };
 
     const pkgJsonFiles = allFiles.filter(f => path.basename(f) === 'package.json');
@@ -281,6 +294,7 @@ function scanProjectFiles(allFiles, projectRoot) {
     log.info("Scanning file signatures and for exfiltration patterns...");
     const envRegex = new RegExp(ENV_PATTERNS.join('|'));
     const exfilRegex = new RegExp(EXFIL_PATTERNS.join('|'));
+    const commandRegex = new RegExp(MALICIOUS_COMMAND_PATTERNS.join('|').replace(/%/g, '%').replace(/\*/g, '\\*'), 'i');
 
     for (const file of allFiles) {
         try {
@@ -295,11 +309,21 @@ function scanProjectFiles(allFiles, projectRoot) {
                 findings.hashMatches.push(path.relative(projectRoot, file));
             }
 
-            // 2. Check for correlated exfiltration (only for text files)
+            // 2. Check filename
+            if (MALICIOUS_FILENAMES.has(path.basename(file))) {
+                findings.filenameMatches.push(path.relative(projectRoot, file));
+            }
+
+            // 3. Check for correlated exfiltration and malicious commands (only for text files)
             if (file.endsWith('.js') || file.endsWith('.ts') || file.endsWith('.json') || file.endsWith('.sh') || file.endsWith('.yml')) {
                 const content = fileBuffer.toString('utf-8');
                 const hasEnv = envRegex.test(content);
                 const hasExfil = exfilRegex.test(content);
+
+                // Check for malicious commands
+                if (commandRegex.test(content)) {
+                    findings.commandMatches.push(path.relative(projectRoot, file));
+                }
 
                 if (hasEnv && hasExfil) {
                     findings.correlatedExfil.push(path.relative(projectRoot, file));
@@ -386,6 +410,7 @@ async function main() {
         log.header("Module 2: Project Structure & Content Analysis");
         const allFiles = getAllFiles(projectRoot);
         const fileScanFindings = scanProjectFiles(allFiles, projectRoot);
+        const homeDirFindings = scanHomeDirectory();
 
         // --- Reporting ---
         log.header("Scan Report");
@@ -399,6 +424,24 @@ async function main() {
                 report += `   - File with matching signature: ${colors.YELLOW}${match}${colors.RESET}\n`;
             });
             report += "   NOTE: This is a definitive indicator of compromise. Immediate investigation is required.\n\n";
+        }
+
+        if (homeDirFindings.length > 0) {
+            issuesFound = true;
+            report += `${colors.RED}🚨 HIGH RISK: Malicious Artifacts Found in Home Directory${colors.RESET}\n`;
+            homeDirFindings.forEach(match => {
+                report += `   - ${colors.YELLOW}${match}${colors.RESET}\n`;
+            });
+            report += "   NOTE: These artifacts are used to store and execute malicious tools.\n\n";
+        }
+
+        if (fileScanFindings.filenameMatches.length > 0) {
+            issuesFound = true;
+            report += `${colors.RED}🚨 HIGH RISK: Known Malicious Filename Detected${colors.RESET}\n`;
+            fileScanFindings.filenameMatches.forEach(match => {
+                report += `   - File: ${colors.YELLOW}${match}${colors.RESET}\n`;
+            });
+            report += "   NOTE: These filenames are associated with malicious scripts.\n\n";
         }
 
         if (fileScanFindings.correlatedExfil.length > 0) {
@@ -435,6 +478,15 @@ async function main() {
                 report += `   - ${match}\n`;
             });
             report += "   NOTE: 'postinstall' scripts can execute arbitrary commands and require review.\n\n";
+        }
+
+        if (fileScanFindings.commandMatches.length > 0) {
+            issuesFound = true;
+            report += `${colors.YELLOW}⚠️ MEDIUM RISK: Suspicious Commands Found in Files${colors.RESET}\n`;
+            fileScanFindings.commandMatches.forEach(match => {
+                report += `   - File: ${colors.YELLOW}${match}${colors.RESET}\n`;
+            });
+            report += "   NOTE: These files contain commands known to be used for malicious purposes.\n\n";
         }
 
         if (issuesFound) {
