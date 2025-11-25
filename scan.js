@@ -339,6 +339,30 @@ function scanProjectFiles(allFiles, projectRoot) {
 }
 
 /**
+ * Scans the user's home directory for known malicious artifacts.
+ * @returns {string[]} A list of found malicious paths.
+ */
+function scanHomeDirectory() {
+    log.info("Scanning user home directory for known artifacts...");
+    const homeDir = require('os').homedir();
+    const findings = [];
+    const truffleCachePath = path.join(homeDir, '.truffler-cache');
+
+    if (fs.existsSync(truffleCachePath)) {
+        findings.push(`Directory: ${truffleCachePath}`);
+        // Also check for the specific binaries inside
+        const trufflehogPath = path.join(truffleCachePath, 'trufflehog');
+        const trufflehogExePath = path.join(truffleCachePath, 'trufflehog.exe');
+        if (fs.existsSync(trufflehogPath)) {
+            findings.push(`File: ${trufflehogPath}`);
+        }
+        if (fs.existsSync(trufflehogExePath)) {
+            findings.push(`File: ${trufflehogExePath}`);
+        }
+    }
+    return findings;
+}
+/**
  * Orchestrates the dependency analysis.
  * @param {string} projectRoot The root of the project.
  * @returns {Promise<Set<string>>} A set of matched compromised dependencies.
