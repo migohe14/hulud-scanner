@@ -11,5 +11,8 @@
   },
   "author": "miguel.sngular",
   "license": "ISC",
-  "repository": "https://github.com/migohe14/hulud-scanner"
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/migohe14/hulud-scanner.git"
+  }
 }
