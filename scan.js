@@ -6,37 +6,28 @@ const crypto = require('crypto');
 const { execSync } = require('child_process');
 
 // --- Configuration ---
-const COMPROMISED_LIST_URL = "https://raw.githubusercontent.com/migohe14/hulud-scanner/refs/heads/main/compromised-libs.txt";
-const MALICIOUS_HASHES = new Set([
-    "46faab8ab153fae6e80e7cca38eab363075bb524edd79e42269217a083628f09",
-    "de0e25a3e6c1e1e5998b306b7141b3dc4c0088da9d7bb47c1c00c91e6e4f85d6",
-    "81d2a004a1bca6ef87a1caf7d0e0b355ad1764238e40ff6d1b1cb77ad4f595c3",
-    "83a650ce44b2a9854802a7fb4c202877815274c129af49e6c2d1d5d5d55c501e",
-    "4b2399646573bb737c4969563303d8ee2e9ddbd1b271f1ca9e35ea78062538db",
-    "dc67467a39b70d1cd4c1f7f7a459b35058163592f4a9e8fb4dffcbba98ef210c",
-    "b74caeaa75e077c99f7d44f46daaf9796a3be43ecf24f2a1fd381844669da777",
-    "86532ed94c5804e1ca32fa67257e1bb9de628e3e48a1f56e67042dc055effb5b",
-    "aba1fcbd15c6ba6d9b96e34cec287660fff4a31632bf76f2a766c499f55ca1ee",
-]);
-const COMPROMISED_NAMESPACES = [
-    "@crowdstrike", "@art-ws", "@ngx", "@ctrl", "@nativescript-community",
-    "@ahmedhfarag", "@operato", "@teselagen", "@things-factory", "@hestjs",
-    "@nstudio", "@basic-ui-components-stc", "@nexe", "@thangved",
-    "@tnf-dev", "@ui-ux-gang", "@yoobic"
-];
-const EXFIL_PATTERNS = ['webhook.site', 'bb8ca5f6-4175-45d2-b042-fc9ebb8170b7', 'exfiltrat'];
-const ENV_PATTERNS = ['process\\.env', 'os\\.environ', 'getenv', 'AWS_ACCESS_KEY', 'GITHUB_TOKEN', 'NPM_TOKEN'];
-const MALICIOUS_FILENAMES = new Set([
-    'bun_environment.js',
-    'trufflehog',
-    'trufflehog.exe'
-]);
-const MALICIOUS_COMMAND_PATTERNS = [
-    'bun.sh/install', // Catches both curl and powershell variants
-    'del /F /Q /S "%USERPROFILE%\\*"',
-    'shred -uvz -n 1',
-    'cipher /W:%USERPROFILE%'
-];
+const IOC_URLS = {
+    COMPROMISED_LIBS: "https://raw.githubusercontent.com/migohe14/hulud-scanner/refs/heads/main/compromised-libs.txt",
+    ENV_PATTERNS: "https://raw.githubusercontent.com/migohe14/hulud-scanner/refs/heads/main/env-patterns.txt",
+    EXFIL_PATTERNS: "https://raw.githubusercontent.com/migohe14/hulud-scanner/refs/heads/main/exfil-patterns.txt",
+    MALICIOUS_COMMANDS: "https://raw.githubusercontent.com/migohe14/hulud-scanner/refs/heads/main/malicious-commands.txt",
+    MALICIOUS_FILENAMES: "https://raw.githubusercontent.com/migohe14/hulud-scanner/refs/heads/main/malicious-filenames.txt",
+    MALICIOUS_HASHES: "https://raw.githubusercontent.com/migohe14/hulud-scanner/refs/heads/main/malicious-hashes.txt"
+};
+
+// --- MITRE ATT&CK & Scoring Configuration ---
+const MITRE_ATTACK = {
+    "T1064": { name: "Scripting", tactic: "Execution", baseScore: 5 },
+    "T1552": { name: "Unsecured Credentials", tactic: "Credential Access", baseScore: 6 },
+    "T1082": { name: "System Information Discovery", tactic: "Discovery", baseScore: 3 },
+    "T1518": { name: "Software Discovery", tactic: "Discovery", baseScore: 3 },
+    "T1053": { name: "Scheduled Task/Job", tactic: "Persistence", baseScore: 8 },
+    "T1098": { name: "Account Manipulation", tactic: "Persistence", baseScore: 7 },
+    "T1059": { name: "Command and Scripting Interpreter", tactic: "Execution", baseScore: 6 },
+    "T1027": { name: "Obfuscated Files or Information", tactic: "Defense Evasion", baseScore: 5 },
+    "T1195": { name: "Supply Chain Compromise", tactic: "Initial Access", baseScore: 25 }, // IOC Match
+    "T1567": { name: "Exfiltration Over Web Service", tactic: "Exfiltration", baseScore: 9 }
+};
 
 // --- Console Colors ---
 const colors = {
@@ -55,6 +46,20 @@ const log = {
     header: (msg) => console.log(`\n${colors.BLUE}${colors.BOLD}--- ${msg} ---${colors.RESET}`),
 };
 
+class Finding {
+    constructor(technique, description, severity, evidence, file) {
+        this.technique = technique;
+        this.tactic = MITRE_ATTACK[technique]?.tactic || "Unknown";
+        this.name = MITRE_ATTACK[technique]?.name || "Unknown";
+        this.description = description;
+        this.severity = severity;
+        this.evidence = evidence;
+        this.file = file;
+        const multipliers = { "CRITICAL": 4, "HIGH": 2, "MEDIUM": 1, "LOW": 0.5 };
+        this.score = (MITRE_ATTACK[technique]?.baseScore || 1) * (multipliers[severity] || 1);
+    }
+}
+
 /**
  * Checks if a command exists on the system.
  * @param {string} cmd The command to check.
@@ -70,42 +75,56 @@ function commandExists(cmd) {
 }
 
 /** 
- * Downloads the list of compromised packages from GitHub.
- * @returns {Promise<Set<string>>} A Set of packages in "name@version" format.
+ * Fetches a list of strings from a URL, ignoring comments and empty lines.
+ * @param {string} url The URL to fetch.
+ * @returns {Promise<string[]>} A list of strings.
  */
-async function getCompromisedPackages() {
-    log.info("Downloading compromised packages list...");
+async function fetchRemoteList(url) {
     return new Promise((resolve, reject) => {
-        https.get(COMPROMISED_LIST_URL, (res) => {
+        https.get(url, (res) => {
+            if (res.statusCode !== 200) {
+                reject(new Error(`Failed to fetch ${url}: Status Code ${res.statusCode}`));
+                return;
+            }
             let data = '';
             res.on('data', (chunk) => { data += chunk; });
             res.on('end', () => {
-                const packages = data
+                const lines = data
                     .split('\n') // Split into lines
                     .map(line => line.trim()) // Trim whitespace
                     .filter(line => line && !line.startsWith('#')); // Ignore comments and empty lines
-
-                const allCompromised = [];
-
-                packages.forEach(line => {
-                    if (line.includes(',=')) {
-                        // Handles format: "pkg-name,= 1.0.0 || = 2.0.0"
-                        const [name, versionsPart] = line.split(',=');
-                        const versions = versionsPart.split('||').map(v => v.replace('=', '').trim());
-                        versions.forEach(version => {
-                            if (name && version) allCompromised.push(`${name.trim()}@${version}`);
-                        });
-                    } else if (line.includes(':')) {
-                        // Handles original format: "pkg-name:1.0.0"
-                        allCompromised.push(line.replace(':', '@'));
-                    }
-                });
-                resolve(allCompromised);
+                resolve(lines);
             });
-        }).on('error', (err) => {
-            reject(new Error(`Failed to download compromised list: ${err.message}`));
-        });
+        }).on('error', (err) => reject(err));
     });
+}
+
+/**
+ * Parses the raw lines of the compromised libs file into a list of "name@version".
+ * @param {string[]} lines The raw lines from the file.
+ * @returns {string[]} Parsed packages.
+ */
+function parseCompromisedLibs(lines) {
+    const allCompromised = [];
+    lines.forEach(line => {
+        if (line.includes(',=')) {
+            // Handles format: "pkg-name,= 1.0.0 || = 2.0.0"
+            const [name, versionsPart] = line.split(',=');
+            const versions = versionsPart.split('||').map(v => v.replace('=', '').trim());
+            versions.forEach(version => {
+                if (name && version) allCompromised.push(`${name.trim()}@${version}`);
+            });
+        } else if (line.includes(':')) {
+            // Handles original format: "pkg-name:1.0.0"
+            allCompromised.push(line.replace(':', '@'));
+        } else if (line.lastIndexOf('@') > 0) {
+            // Handles format: "pkg-name@1.0.0" or "@scope/pkg@1.0.0"
+            // We check lastIndexOf('@') > 0 to ensure there is a version separator,
+            // avoiding cases like just "@scope/pkg" (which implies no specific version).
+            allCompromised.push(line);
+        }
+    });
+    return allCompromised;
 }
 
 /** 
@@ -291,7 +310,7 @@ function getPackagesFromNodeModules(projectRoot, compromisedNames) {
  */
 function getAllFiles(directory) {
     const filesToScan = [];
-    const ignoredDirs = new Set(['node_modules', '.git']);
+    const ignoredDirs = new Set(['node_modules', '.git', '.angular', '.next', '.nuxt', 'dist', 'build', 'coverage']);
     const ignoredExtensions = new Set(['.md', '.d.ts', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.woff', '.woff2', '.eot', '.ttf', '.ico']);
 
     function findFiles(dir) {
@@ -323,41 +342,31 @@ function getAllFiles(directory) {
  * Scans a list of files for multiple types of threats.
  * @param {string[]} allFiles - A list of absolute file paths to scan.
  * @param {string} projectRoot - The root directory of the project for relative paths.
- * @returns {object} An object containing arrays of different findings.
+ * @param {object} iocs - Object containing IOC sets and arrays.
+ * @returns {Finding[]} A list of findings.
  */
-function scanProjectFiles(allFiles, projectRoot) {
+function scanProjectFiles(allFiles, projectRoot, iocs) {
     log.info(`Scanning ${allFiles.length} project files for malicious indicators...`);
 
-    const findings = {
-        hashMatches: [],
-        namespaceMatches: new Set(),
-        hookMatches: [],
-        correlatedExfil: [],
-        filenameMatches: [],
-        commandMatches: [],
-    };
-
+    const findings = [];
     const pkgJsonFiles = allFiles.filter(f => path.basename(f) === 'package.json');
 
-    // Scan for compromised namespaces and postinstall hooks in package.json files
-    log.info("Checking for compromised namespaces and package.json hooks...");
+    // Scan for postinstall hooks in package.json files
+    log.info("Checking for package.json hooks...");
     for (const file of pkgJsonFiles) {
         try {
             const content = fs.readFileSync(file, 'utf-8');
             const pkg = JSON.parse(content);
 
-            // Check namespaces
-            const allDeps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-            for (const depName in allDeps) {
-                const namespace = depName.split('/')[0];
-                if (COMPROMISED_NAMESPACES.includes(namespace)) {
-                    findings.namespaceMatches.add(`Warning: Contains packages from compromised namespace: ${namespace} (Found in ${path.relative(projectRoot, file)})`);
-                }
-            }
-
             // Check for postinstall hooks
-            if (pkg.scripts && pkg.scripts.postinstall) {
-                findings.hookMatches.push(`File: ${path.relative(projectRoot, file)}`);
+            if (pkg.scripts) {
+                const hooks = ['preinstall', 'install', 'postinstall', 'prepare'];
+                hooks.forEach(hook => {
+                    if (pkg.scripts[hook]) {
+                        findings.push(new Finding("T1064", `Lifecycle Hook Detected (${hook})`, "LOW", `Script: ${pkg.scripts[hook]}`, path.relative(projectRoot, file)));
+                        // Check for suspicious commands inside the hook
+                    }
+                });
             }
         } catch (e) {
             log.warn(`Could not parse ${path.relative(projectRoot, file)}: ${e.message}`);
@@ -366,9 +375,8 @@ function scanProjectFiles(allFiles, projectRoot) {
 
     // Scan file contents for hashes and exfiltration patterns
     log.info("Scanning file signatures and for exfiltration patterns...");
-    const envRegex = new RegExp(ENV_PATTERNS.join('|'));
-    const exfilRegex = new RegExp(EXFIL_PATTERNS.join('|'));
-    const commandRegex = new RegExp(MALICIOUS_COMMAND_PATTERNS.join('|').replace(/%/g, '%').replace(/\*/g, '\\*'), 'i');
+    const envRegex = new RegExp(iocs.envPatterns.join('|'));
+    const exfilRegex = new RegExp(iocs.exfilPatterns.join('|'));
 
     for (const file of allFiles) {
         try {
@@ -379,28 +387,44 @@ function scanProjectFiles(allFiles, projectRoot) {
             hashSum.update(fileBuffer);
             const hex = hashSum.digest('hex');
 
-            if (MALICIOUS_HASHES.has(hex)) {
-                findings.hashMatches.push(path.relative(projectRoot, file));
+            if (iocs.maliciousHashes.has(hex)) {
+                findings.push(new Finding("T1195", "Known Malicious File Hash", "CRITICAL", `Hash: ${hex}`, path.relative(projectRoot, file)));
             }
 
             // 2. Check filename
-            if (MALICIOUS_FILENAMES.has(path.basename(file))) {
-                findings.filenameMatches.push(path.relative(projectRoot, file));
+            if (iocs.maliciousFilenames.has(path.basename(file))) {
+                findings.push(new Finding("T1195", "Known Malicious Filename", "HIGH", `Filename: ${path.basename(file)}`, path.relative(projectRoot, file)));
             }
 
-            // 3. Check for correlated exfiltration and malicious commands (only for text files)
+            // 3. Behavioral Analysis (Text files)
             if (file.endsWith('.js') || file.endsWith('.ts') || file.endsWith('.json') || file.endsWith('.sh') || file.endsWith('.yml')) {
                 const content = fileBuffer.toString('utf-8');
-                const hasEnv = envRegex.test(content);
-                const hasExfil = exfilRegex.test(content);
-
-                // Check for malicious commands
-                if (commandRegex.test(content)) {
-                    findings.commandMatches.push(path.relative(projectRoot, file));
+                
+                // T1552: Unsecured Credentials
+                if (/\bprocess\.env\b/.test(content) || envRegex.test(content)) {
+                    findings.push(new Finding("T1552", "Access to Environment Variables", "LOW", "Pattern: process.env or similar", path.relative(projectRoot, file)));
                 }
 
-                if (hasEnv && hasExfil) {
-                    findings.correlatedExfil.push(path.relative(projectRoot, file));
+                // T1518: Software Discovery (CI/Runners)
+                if (/\bGITHUB_ACTIONS\b|\bCI\b|\bGITLAB_CI\b/.test(content)) {
+                    findings.push(new Finding("T1518", "CI Environment Discovery", "LOW", "Pattern: CI/GITHUB_ACTIONS", path.relative(projectRoot, file)));
+                }
+
+                // T1082: System Information Discovery
+                if (/\bos\.platform\(\)|\bos\.userInfo\(\)|\bhomedir\(\)/.test(content)) {
+                    findings.push(new Finding("T1082", "System Information Discovery", "LOW", "Pattern: os.platform/userInfo", path.relative(projectRoot, file)));
+                }
+
+                // T1059: Command Execution
+                if (/\bchild_process\b|\bexec\s*\(|\bspawn\s*\(|\bexecSync\s*\(/.test(content)) {
+                    findings.push(new Finding("T1059", "Process Execution", "MEDIUM", "Pattern: child_process/exec", path.relative(projectRoot, file)));
+                }
+
+                // T1053: Persistence via Workflows
+                if (file.includes('.github/workflows')) {
+                    if (/run:.*npm publish/.test(content) || /run:.*git push/.test(content)) {
+                        findings.push(new Finding("T1098", "Suspicious Workflow Action", "HIGH", "Pattern: npm publish/git push in workflow", path.relative(projectRoot, file)));
+                    }
                 }
             }
         } catch (e) {
@@ -417,23 +441,41 @@ function scanProjectFiles(allFiles, projectRoot) {
  * This is a targeted scan for performance reasons.
  * @param {string} nodeModulesPath - The absolute path to the node_modules directory.
  * @param {string} projectRoot - The root directory of the project for relative paths.
- * @returns {string[]} A list of found malicious file paths.
+ * @param {object} iocs - Object containing IOC sets and arrays.
+ * @returns {Finding[]} A list of findings.
  */
-function scanNodeModulesForFiles(nodeModulesPath, projectRoot) {
+function scanNodeModulesForFiles(nodeModulesPath, projectRoot, iocs) {
     if (!fs.existsSync(nodeModulesPath)) {
         return [];
     }
-    log.info("Scanning node_modules for specific malicious filenames...");
+    log.info("Scanning node_modules for malicious filenames and suspicious package.json scripts...");
     const findings = [];
+    
+    // Regex for malicious commands (same as in scanProjectFiles)
+    const commandRegex = new RegExp(iocs.maliciousCommands.join('|').replace(/%/g, '%').replace(/\*/g, '\\*'), 'i');
 
     function findFiles(dir) {
-        const entries = fs.readdirSync(dir, { withFileTypes: true });
+        let entries;
+        try {
+            entries = fs.readdirSync(dir, { withFileTypes: true });
+        } catch (e) { return; }
+
         for (const entry of entries) {
             const fullPath = path.join(dir, entry.name);
             if (entry.isDirectory()) {
                 findFiles(fullPath);
-            } else if (entry.isFile() && MALICIOUS_FILENAMES.has(entry.name)) {
-                findings.push(path.relative(projectRoot, fullPath));
+            } else if (entry.isFile()) {
+                if (iocs.maliciousFilenames.has(entry.name)) {
+                    findings.push(new Finding("T1195", "Malicious Filename in node_modules", "HIGH", `File: ${entry.name}`, path.relative(projectRoot, fullPath)));
+                } else if (entry.name === 'package.json') {
+                    // Inspect package.json inside node_modules for malicious commands
+                    try {
+                        const content = fs.readFileSync(fullPath, 'utf-8');
+                        if (commandRegex.test(content)) {
+                            findings.push(new Finding("T1195", "Malicious Command in Dependency", "CRITICAL", "Pattern match in package.json", path.relative(projectRoot, fullPath)));
+                        }
+                    } catch (e) { /* ignore read errors */ }
+                }
             }
         }
     }
@@ -443,7 +485,7 @@ function scanNodeModulesForFiles(nodeModulesPath, projectRoot) {
 }
 /**
  * Scans the user's home directory for known malicious artifacts.
- * @returns {string[]} A list of found malicious paths.
+ * @returns {Finding[]} A list of findings.
  */
 function scanHomeDirectory() {
     log.info("Scanning user home directory for known artifacts...");
@@ -452,15 +494,15 @@ function scanHomeDirectory() {
     const truffleCachePath = path.join(homeDir, '.truffler-cache');
 
     if (fs.existsSync(truffleCachePath)) {
-        findings.push(`Directory: ${truffleCachePath}`);
+        findings.push(new Finding("T1552", "Malicious Artifact (Trufflehog Cache)", "HIGH", `Path: ${truffleCachePath}`, "HOME_DIR"));
         // Also check for the specific binaries inside
         const trufflehogPath = path.join(truffleCachePath, 'trufflehog');
         const trufflehogExePath = path.join(truffleCachePath, 'trufflehog.exe');
         if (fs.existsSync(trufflehogPath)) {
-            findings.push(`File: ${trufflehogPath}`);
+            findings.push(new Finding("T1552", "Malicious Binary (Trufflehog)", "HIGH", `Path: ${trufflehogPath}`, "HOME_DIR"));
         }
         if (fs.existsSync(trufflehogExePath)) {
-            findings.push(`File: ${trufflehogExePath}`);
+            findings.push(new Finding("T1552", "Malicious Binary (Trufflehog.exe)", "HIGH", `Path: ${trufflehogExePath}`, "HOME_DIR"));
         }
     }
     return findings;
@@ -468,9 +510,10 @@ function scanHomeDirectory() {
 /**
  * Orchestrates the dependency analysis.
  * @param {string} projectRoot The root of the project.
- * @returns {Promise<Set<string>>} A set of matched compromised dependencies.
+ * @param {Set<string>} compromisedPackagesWithVersions - Set of known compromised packages.
+ * @returns {Promise<Finding[]>} A list of findings.
  */
-async function runDependencyAnalysis(projectRoot) {
+async function runDependencyAnalysis(projectRoot, compromisedPackagesWithVersions) {
     log.header("Module 1: Dependency Analysis");
     const pnpmLockFile = path.join(projectRoot, 'pnpm-lock.yaml');
     const yarnLockFile = path.join(projectRoot, 'yarn.lock');
@@ -479,7 +522,7 @@ async function runDependencyAnalysis(projectRoot) {
 
     if (!fs.existsSync(pkgFile)) {
         log.warn("No package.json found. Skipping all dependency analysis.");
-        return new Set();
+        return [];
     }
 
     let localPackages = new Set();
@@ -499,9 +542,11 @@ async function runDependencyAnalysis(projectRoot) {
         localPackages = parsePackageJson(pkgFile);
     }
 
-    const compromisedPackagesWithVersions = new Set(await getCompromisedPackages());
     // Create a set of just the names for directory matching
-    const compromisedPackageNames = new Set(Array.from(compromisedPackagesWithVersions).map(pkg => pkg.split('@')[0]));
+    const compromisedPackageNames = new Set(Array.from(compromisedPackagesWithVersions).map(pkg => {
+        const lastAt = pkg.lastIndexOf('@');
+        return lastAt > 0 ? pkg.substring(0, lastAt) : pkg.split('@')[0];
+    }));
 
     // Perform a deep scan of node_modules to catch packages not in lockfiles
     const directScanPackages = getPackagesFromNodeModules(projectRoot, compromisedPackageNames);
@@ -510,19 +555,71 @@ async function runDependencyAnalysis(projectRoot) {
 
     if (localPackages.size === 0) {
         log.warn("Could not determine local packages. Skipping version check.");
-        return new Set();
+        return [];
     }
 
     log.info("Checking for vulnerable versions...");
-    const matches = new Set();
+    const findings = [];
     for (const localPkg of localPackages) {
         if (compromisedPackagesWithVersions.has(localPkg) || localPkg.includes('(directory found without package.json)')) {
-            matches.add(localPkg);
+            let evidence = `Package: ${localPkg}\n    IOC Source: ${IOC_URLS.COMPROMISED_LIBS}`;
+            const lastAt = localPkg.lastIndexOf('@');
+            if (lastAt > 0) {
+                const name = localPkg.substring(0, lastAt);
+                const localPath = path.join(projectRoot, 'node_modules', name);
+                evidence += `\n    Path: ${localPath}`;
+            }
+            findings.push(new Finding("T1195", "Compromised Package Version", "CRITICAL", evidence, "package.json/lockfile"));
         }
     }
     log.info("Dependency analysis complete.");
-    return matches;
+    return findings;
 }
+
+/**
+ * Calculates the final score and verdict based on findings and correlations.
+ * @param {Finding[]} findings 
+ */
+function calculateRisk(findings) {
+    let totalScore = 0;
+    const techniquesDetected = new Set();
+    const tacticsDetected = new Set();
+
+    findings.forEach(f => {
+        totalScore += f.score;
+        techniquesDetected.add(f.technique);
+        tacticsDetected.add(f.tactic);
+    });
+
+    // --- Correlation Logic ---
+    const hasScripting = techniquesDetected.has("T1064"); // Lifecycle hooks
+    const hasCredAccess = techniquesDetected.has("T1552"); // process.env
+    const hasDiscovery = techniquesDetected.has("T1518") || techniquesDetected.has("T1082"); // CI or Sys info
+    const hasExecution = techniquesDetected.has("T1059"); // child_process
+
+    let suspectedFamily = "None";
+    let correlationBonus = 0;
+
+    // Rule: T1064 + T1552 + T1518 -> High probability of Shai Hulud
+    if (hasScripting && hasCredAccess && hasDiscovery) {
+        correlationBonus += 50;
+        suspectedFamily = "Shai-Hulud (High Confidence)";
+        findings.push(new Finding("CORRELATION", "Behavioral Pattern Match: Shai-Hulud", "CRITICAL", "Combination of Install Script + Env Access + CI Discovery", "Multiple Sources"));
+    } else if (hasScripting && hasExecution) {
+        correlationBonus += 20;
+        suspectedFamily = "Generic Malware Loader";
+    }
+
+    totalScore += correlationBonus;
+
+    let verdict = "LOW";
+    if (totalScore > 80) verdict = "CRITICAL";
+    else if (totalScore > 40) verdict = "HIGH";
+    else if (totalScore > 15) verdict = "MEDIUM";
+
+    return { totalScore, verdict, suspectedFamily, techniques: Array.from(techniquesDetected) };
+}
+
 /** 
  * Main function to orchestrate the scan.
  */
@@ -539,92 +636,86 @@ async function main() {
         console.log(`\n${colors.BLUE}${colors.BOLD}--- Shai-Hulud Integrity Scanner (Node.js) ---${colors.RESET}`);
         log.info(`Scanning project at: ${projectRoot}`);
 
+        // --- Fetch IOCs ---
+        log.info("Downloading IOC definitions from remote repositories...");
+        const [
+            compromisedLibsLines,
+            maliciousHashes,
+            maliciousFilenames,
+            maliciousCommands,
+            exfilPatterns,
+            envPatterns
+        ] = await Promise.all([
+            fetchRemoteList(IOC_URLS.COMPROMISED_LIBS),
+            fetchRemoteList(IOC_URLS.MALICIOUS_HASHES),
+            fetchRemoteList(IOC_URLS.MALICIOUS_FILENAMES),
+            fetchRemoteList(IOC_URLS.MALICIOUS_COMMANDS),
+            fetchRemoteList(IOC_URLS.EXFIL_PATTERNS),
+            fetchRemoteList(IOC_URLS.ENV_PATTERNS)
+        ]);
+
+        const iocs = {
+            maliciousHashes: new Set(maliciousHashes),
+            maliciousFilenames: new Set(maliciousFilenames),
+            maliciousCommands: maliciousCommands,
+            exfilPatterns: exfilPatterns,
+            envPatterns: envPatterns,
+            compromisedPackages: new Set(parseCompromisedLibs(compromisedLibsLines))
+        };
+
+        log.info(`Loaded IOCs: ${iocs.compromisedPackages.size} compromised pkgs, ${iocs.maliciousHashes.size} hashes, ${iocs.maliciousFilenames.size} filenames.`);
+
         // --- Run Analyses ---
-        const dependencyMatches = await runDependencyAnalysis(projectRoot);
+        const allFindings = [];
+        
+        const dependencyFindings = await runDependencyAnalysis(projectRoot, iocs.compromisedPackages);
+        allFindings.push(...dependencyFindings);
 
         log.header("Module 2: Project Structure & Content Analysis");
         const allFiles = getAllFiles(projectRoot);
-        const fileScanFindings = scanProjectFiles(allFiles, projectRoot);
+        const fileFindings = scanProjectFiles(allFiles, projectRoot, iocs);
+        allFindings.push(...fileFindings);
+
         const homeDirFindings = scanHomeDirectory();
-        const nodeModulesFindings = scanNodeModulesForFiles(path.join(projectRoot, 'node_modules'), projectRoot);
+        allFindings.push(...homeDirFindings);
+
+        const nodeModulesFindings = scanNodeModulesForFiles(path.join(projectRoot, 'node_modules'), projectRoot, iocs);
+        allFindings.push(...nodeModulesFindings);
+
+        // --- Scoring & Correlation ---
+        const riskAssessment = calculateRisk(allFindings);
 
         // --- Reporting ---
         log.header("Scan Report");
-        let issuesFound = false;
-        let report = "";
+        
+        // JSON Output support
+        if (process.argv.includes('--json')) {
+            console.log(JSON.stringify({
+                risk: riskAssessment,
+                findings: allFindings
+            }, null, 2));
+            process.exit(riskAssessment.verdict === 'LOW' ? 0 : 1);
+        }
 
-        if (fileScanFindings.hashMatches.length > 0) {
-            issuesFound = true;
-            report += `${colors.RED}🚨 CRITICAL RISK: Known Malware Signature Detected${colors.RESET}\n`;
-            fileScanFindings.hashMatches.forEach(match => {
-                report += `   - File with matching signature: ${colors.YELLOW}${match}${colors.RESET}\n`;
+        // Human Readable Output
+        console.log(`\n${colors.BOLD}Risk Verdict:${colors.RESET} ${riskAssessment.verdict === 'CRITICAL' || riskAssessment.verdict === 'HIGH' ? colors.RED : riskAssessment.verdict === 'MEDIUM' ? colors.YELLOW : colors.GREEN}${riskAssessment.verdict}${colors.RESET}`);
+        console.log(`${colors.BOLD}Total Score:${colors.RESET} ${riskAssessment.totalScore}`);
+        console.log(`${colors.BOLD}Suspected Family:${colors.RESET} ${riskAssessment.suspectedFamily}`);
+        console.log(`${colors.BOLD}MITRE Techniques:${colors.RESET} ${riskAssessment.techniques.join(', ')}\n`);
+
+        if (allFindings.length > 0) {
+            console.log(`${colors.BOLD}Detailed Findings:${colors.RESET}`);
+            allFindings.sort((a, b) => b.score - a.score).forEach(f => {
+                const color = f.severity === 'CRITICAL' ? colors.RED : f.severity === 'HIGH' ? colors.RED : f.severity === 'MEDIUM' ? colors.YELLOW : colors.BLUE;
+                console.log(`[${color}${f.severity}${colors.RESET}] ${colors.BOLD}${f.technique} - ${f.name}${colors.RESET}`);
+                console.log(`    File: ${f.file}`);
+                console.log(`    Evidence: ${f.evidence}`);
+                console.log(`    Description: ${f.description}\n`);
             });
-            report += "   NOTE: This is a definitive indicator of compromise. Immediate investigation is required.\n\n";
         }
 
-        if (homeDirFindings.length > 0) {
-            issuesFound = true;
-            report += `${colors.RED}🚨 HIGH RISK: Malicious Artifacts Found in Home Directory${colors.RESET}\n`;
-            homeDirFindings.forEach(match => {
-                report += `   - ${colors.YELLOW}${match}${colors.RESET}\n`;
-            });
-            report += "   NOTE: These artifacts are used to store and execute malicious tools.\n\n";
-        }
-
-        // Merge findings from node_modules into the main filename matches before reporting
-        if (nodeModulesFindings.length > 0) {
-            issuesFound = true; // Mark that we found an issue
-            fileScanFindings.filenameMatches.push(...nodeModulesFindings);
-        }
-
-        if (fileScanFindings.filenameMatches.length > 0) {
-            issuesFound = true;
-            report += `${colors.RED}🚨 HIGH RISK: Known Malicious Filename Detected${colors.RESET}\n`;
-            fileScanFindings.filenameMatches.forEach(match => {
-                report += `   - File: ${colors.YELLOW}${match}${colors.RESET}\n`;
-            });
-            report += "   NOTE: These files access secrets AND contain data exfiltration patterns.\n\n";
-        }
-
-        if (dependencyMatches.size > 0) {
-            issuesFound = true;
-            report += `${colors.RED}🚨 HIGH RISK: Compromised Package Versions Detected${colors.RESET}\n`;
-            dependencyMatches.forEach(match => {
-                report += `   - Package: ${colors.YELLOW}${match}${colors.RESET}\n`;
-            });
-            report += "   NOTE: These specific package versions are known to be compromised.\n\n";
-        }
-
-        if (fileScanFindings.namespaceMatches.size > 0) {
-            issuesFound = true;
-            report += `${colors.YELLOW}⚠️ MEDIUM RISK: Packages from Compromised Namespaces${colors.RESET}\n`;
-            fileScanFindings.namespaceMatches.forEach(match => {
-                report += `   - ${match}\n`;
-            });
-            report += "   NOTE: Review packages from these organizations carefully.\n\n";
-        }
-
-        if (fileScanFindings.hookMatches.length > 0) {
-            issuesFound = true;
-            report += `${colors.YELLOW}⚠️ MEDIUM RISK: Potentially Malicious package.json Hooks${colors.RESET}\n`;
-            fileScanFindings.hookMatches.forEach(match => {
-                report += `   - ${match}\n`;
-            });
-            report += "   NOTE: 'postinstall' scripts can execute arbitrary commands and require review.\n\n";
-        }
-
-        if (fileScanFindings.commandMatches.length > 0) {
-            issuesFound = true;
-            report += `${colors.YELLOW}⚠️ MEDIUM RISK: Suspicious Commands Found in Files${colors.RESET}\n`;
-            fileScanFindings.commandMatches.forEach(match => {
-                report += `   - File: ${colors.YELLOW}${match}${colors.RESET}\n`;
-            });
-            report += "   NOTE: These files contain commands known to be used for malicious purposes.\n\n";
-        }
-
-        if (issuesFound) {
-            console.log(report);
-            log.error("Scan complete. Actionable issues were found.");
+        if (riskAssessment.verdict !== 'LOW') {
+            console.error(`${colors.RED}${colors.BOLD}❌ Scan complete. Potential threats detected.${colors.RESET}`);
             process.exit(2);
         } else {
             log.info(`${colors.GREEN}✅ No actionable project integrity issues found.${colors.RESET}`);
