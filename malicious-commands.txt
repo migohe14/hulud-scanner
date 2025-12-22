@@ -1,0 +1,6 @@
+# Command patterns used by the malware
+# Catches both curl and powershell variants
+bun.sh/install
+del /F /Q /S "%USERPROFILE%\*"
+shred -uvz -n 1
+cipher /W:%USERPROFILE%

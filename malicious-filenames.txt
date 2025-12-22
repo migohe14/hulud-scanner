@@ -1,0 +1,5 @@
+# Filenames associated with the attack
+bun_environment.js
+setup_bun.js
+trufflehog
+trufflehog.exe

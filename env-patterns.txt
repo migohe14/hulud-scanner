@@ -1,0 +1,7 @@
+# Patterns indicating environment variable access
+process\.env
+os\.environ
+getenv
+AWS_ACCESS_KEY
+GITHUB_TOKEN
+NPM_TOKEN
