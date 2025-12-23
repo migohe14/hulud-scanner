@@ -410,7 +410,16 @@ function scanProjectFiles(allFiles, projectRoot, iocs) {
     const envRegex = new RegExp(iocs.envPatterns.join('|'));
     const exfilRegex = new RegExp(iocs.exfilPatterns.join('|'));
 
+    const totalFiles = allFiles.length;
+    let processedFiles = 0;
+
     for (const file of allFiles) {
+        processedFiles++;
+        const percentage = Math.round((processedFiles / totalFiles) * 100);
+        const barLength = 40;
+        const filledLength = Math.round(barLength * (processedFiles / totalFiles));
+        const bar = '█'.repeat(filledLength) + '-'.repeat(barLength - filledLength);
+        process.stdout.write(`\r[${bar}] ${percentage}% (${processedFiles}/${totalFiles})`);
         try {
             const fileBuffer = fs.readFileSync(file);
 
@@ -420,8 +429,7 @@ function scanProjectFiles(allFiles, projectRoot, iocs) {
             const hex = hashSum.digest('hex');
 
             if (iocs.maliciousHashes.has(hex)) {
-                const severity = file.includes('node_modules') ? "WARNING" : "CRITICAL";
-                findings.push(new Finding("T1195", "Known Malicious File Hash", severity, `Hash: ${hex}`, path.relative(projectRoot, file)));
+                findings.push(new Finding("T1195", "Known Malicious File Hash", "CRITICAL", `Hash: ${hex}`, path.relative(projectRoot, file)));
             }
 
             // 2. Check filename
@@ -480,6 +488,8 @@ function scanProjectFiles(allFiles, projectRoot, iocs) {
             // Ignore errors for files that might be deleted during scan, etc.
         }
     }
+
+    process.stdout.write('\n'); // Salto de línea después de la barra de progreso
 
     log.info("File scanning complete.");
     return findings;
