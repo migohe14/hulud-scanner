@@ -370,10 +370,15 @@ function getAllFiles(directory) {
  * @param {string[]} allFiles - A list of absolute file paths to scan.
  * @param {string} projectRoot - The root directory of the project for relative paths.
  * @param {object} iocs - Object containing IOC sets and arrays.
+ * @param {boolean} isDeepScan - Whether to perform a deep scan of all files.
  * @returns {Finding[]} A list of findings.
  */
-function scanProjectFiles(allFiles, projectRoot, iocs) {
-    log.info(`Scanning ${allFiles.length} project files for malicious indicators...`);
+function scanProjectFiles(allFiles, projectRoot, iocs, isDeepScan) {
+    if (isDeepScan) {
+        log.info(`Scanning ${allFiles.length} project files for malicious indicators...`);
+    } else {
+        log.info(`Scanning package.json files for malicious hooks...`);
+    }
 
     const findings = [];
     const pkgJsonFiles = allFiles.filter(f => path.basename(f) === 'package.json');
@@ -403,6 +408,12 @@ function scanProjectFiles(allFiles, projectRoot, iocs) {
         } catch (e) {
             log.warn(`Could not parse ${path.relative(projectRoot, file)}: ${e.message}`);
         }
+    }
+
+    // In a light scan, we only check hooks and stop here.
+    if (!isDeepScan) {
+        log.info("Light file scan complete.");
+        return findings;
     }
 
     // Scan file contents for hashes and exfiltration patterns
@@ -602,9 +613,10 @@ function scanHomeDirectory() {
  * Orchestrates the dependency analysis.
  * @param {string} projectRoot The root of the project.
  * @param {Set<string>} compromisedPackagesWithVersions - Set of known compromised packages.
+ * @param {boolean} isDeepScan - Whether to perform a deep scan of node_modules.
  * @returns {Promise<Finding[]>} A list of findings.
  */
-async function runDependencyAnalysis(projectRoot, compromisedPackagesWithVersions) {
+async function runDependencyAnalysis(projectRoot, compromisedPackagesWithVersions, isDeepScan) {
     log.header("Module 1: Dependency Analysis");
     const pnpmLockFile = path.join(projectRoot, 'pnpm-lock.yaml');
     const yarnLockFile = path.join(projectRoot, 'yarn.lock');
@@ -664,8 +676,11 @@ async function runDependencyAnalysis(projectRoot, compromisedPackagesWithVersion
         return lastAt > 0 ? pkg.substring(0, lastAt) : pkg.split('@')[0];
     }));
 
-    // Perform a deep scan of node_modules to verify installed versions
-    const installedPackages = getPackagesFromNodeModules(projectRoot, compromisedPackageNames);
+    let installedPackages = new Set();
+    if (isDeepScan) {
+        // Perform a deep scan of node_modules to verify installed versions
+        installedPackages = getPackagesFromNodeModules(projectRoot, compromisedPackageNames);
+    }
     const findings = [];
     const reportedPackages = new Set(); // Track reported packages to avoid duplicates
 
@@ -692,7 +707,7 @@ async function runDependencyAnalysis(projectRoot, compromisedPackagesWithVersion
         }
     } else if (localPackages.size > 0) {
         // Fallback: Check lockfiles/manifests if node_modules is missing
-        log.warn("node_modules not scanned. Falling back to lockfile/manifest analysis.");
+        log.warn("node_modules not scanned. Falling back to lockfile/manifest analysis. For a full verification of installed packages, run with the `--deep` flag.");
     }
     // Fallback: Check lockfiles/manifests for packages not already reported from node_modules
     if (localPackages.size > 0) {
@@ -777,8 +792,10 @@ function calculateRisk(findings) {
  */
 async function main() {
     try {
-        // Use the provided path or the current directory.
-        const targetPath = process.argv[2] || '.';
+        const isDeepScan = process.argv.includes('--deep');
+        const isJsonOutput = process.argv.includes('--json');
+        // Use the first non-flag argument as the path, or default to '.'
+        const targetPath = process.argv.slice(2).find(arg => !arg.startsWith('--')) || '.';
         const projectRoot = path.resolve(targetPath);
 
         if (!fs.existsSync(projectRoot) || !fs.statSync(projectRoot).isDirectory()) {
@@ -786,32 +803,43 @@ async function main() {
         }
 
         console.log(`\n${colors.BLUE}${colors.BOLD}--- Shai-Hulud Integrity Scanner (Node.js) ---${colors.RESET}`);
+        log.info(`Scan Mode: ${isDeepScan ? `${colors.YELLOW}DEEP${colors.RESET}` : `${colors.GREEN}LIGHT${colors.RESET}`}`);
         log.info(`Scanning project at: ${projectRoot}`);
 
         // --- Fetch IOCs ---
         log.info("Downloading IOC definitions from remote repositories...");
+
+        // Base IOCs for both light and deep scans
+        const iocPromises = [
+            fetchRemoteList(IOC_URLS.COMPROMISED_LIBS),
+            fetchRemoteList(IOC_URLS.MALICIOUS_COMMANDS) // Needed for hooks
+        ];
+
+        // Add deep scan IOCs if needed
+        if (isDeepScan) {
+            iocPromises.push(
+                fetchRemoteList(IOC_URLS.MALICIOUS_HASHES),
+                fetchRemoteList(IOC_URLS.MALICIOUS_FILENAMES),
+                fetchRemoteList(IOC_URLS.EXFIL_PATTERNS),
+                fetchRemoteList(IOC_URLS.ENV_PATTERNS)
+            );
+        }
+
         const [
             compromisedLibsLines,
-            maliciousHashes,
-            maliciousFilenames,
             maliciousCommands,
-            exfilPatterns,
-            envPatterns
-        ] = await Promise.all([
-            fetchRemoteList(IOC_URLS.COMPROMISED_LIBS),
-            fetchRemoteList(IOC_URLS.MALICIOUS_HASHES),
-            fetchRemoteList(IOC_URLS.MALICIOUS_FILENAMES),
-            fetchRemoteList(IOC_URLS.MALICIOUS_COMMANDS),
-            fetchRemoteList(IOC_URLS.EXFIL_PATTERNS),
-            fetchRemoteList(IOC_URLS.ENV_PATTERNS)
-        ]);
+            maliciousHashes, // May be undefined in light mode
+            maliciousFilenames, // May be undefined in light mode
+            exfilPatterns, // May be undefined in light mode
+            envPatterns // May be undefined in light mode
+        ] = await Promise.all(iocPromises);
 
         const iocs = {
-            maliciousHashes: new Set(maliciousHashes),
-            maliciousFilenames: new Set(maliciousFilenames),
-            maliciousCommands: maliciousCommands,
-            exfilPatterns: exfilPatterns,
-            envPatterns: envPatterns,
+            maliciousHashes: new Set(maliciousHashes || []),
+            maliciousFilenames: new Set(maliciousFilenames || []),
+            maliciousCommands: maliciousCommands || [],
+            exfilPatterns: exfilPatterns || [],
+            envPatterns: envPatterns || [],
             compromisedPackages: new Set(parseCompromisedLibs(compromisedLibsLines))
         };
 
@@ -820,19 +848,22 @@ async function main() {
         // --- Run Analyses ---
         const allFindings = [];
         
-        const dependencyFindings = await runDependencyAnalysis(projectRoot, iocs.compromisedPackages);
+        const dependencyFindings = await runDependencyAnalysis(projectRoot, iocs.compromisedPackages, isDeepScan);
         allFindings.push(...dependencyFindings);
 
         log.header("Module 2: Project Structure & Content Analysis");
         const allFiles = getAllFiles(projectRoot);
-        const fileFindings = scanProjectFiles(allFiles, projectRoot, iocs);
+        const fileFindings = scanProjectFiles(allFiles, projectRoot, iocs, isDeepScan);
         allFindings.push(...fileFindings);
 
-        const homeDirFindings = scanHomeDirectory();
-        allFindings.push(...homeDirFindings);
+        // These modules only run in deep scan mode
+        if (isDeepScan) {
+            const homeDirFindings = scanHomeDirectory();
+            allFindings.push(...homeDirFindings);
 
-        const nodeModulesFindings = scanNodeModulesForFiles(path.join(projectRoot, 'node_modules'), projectRoot, iocs);
-        allFindings.push(...nodeModulesFindings);
+            const nodeModulesFindings = scanNodeModulesForFiles(path.join(projectRoot, 'node_modules'), projectRoot, iocs);
+            allFindings.push(...nodeModulesFindings);
+        }
 
         // --- Scoring & Correlation ---
         const riskAssessment = calculateRisk(allFindings);
@@ -841,7 +872,7 @@ async function main() {
         log.header("Scan Report");
         
         // JSON Output support
-        if (process.argv.includes('--json')) {
+        if (isJsonOutput) {
             console.log(JSON.stringify({
                 risk: riskAssessment,
                 findings: allFindings
