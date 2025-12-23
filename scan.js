@@ -26,7 +26,8 @@ const MITRE_ATTACK = {
     "T1059": { name: "Command and Scripting Interpreter", tactic: "Execution", baseScore: 6 },
     "T1027": { name: "Obfuscated Files or Information", tactic: "Defense Evasion", baseScore: 5 },
     "T1195": { name: "Supply Chain Compromise", tactic: "Initial Access", baseScore: 25 }, // IOC Match
-    "T1567": { name: "Exfiltration Over Web Service", tactic: "Exfiltration", baseScore: 9 }
+    "T1567": { name: "Exfiltration Over Web Service", tactic: "Exfiltration", baseScore: 9 },
+    "T1548": { name: "Abuse Elevation Control Mechanism", tactic: "Privilege Escalation", baseScore: 9 }
 };
 
 // --- Console Colors ---
@@ -46,6 +47,33 @@ const log = {
     header: (msg) => console.log(`\n${colors.BLUE}${colors.BOLD}--- ${msg} ---${colors.RESET}`),
 };
 
+const CRITICAL_PATTERNS = [
+    // Remote code execution patterns - limited repetition
+    { pattern: /curl\s+[^\s|]{1,500}\s*\|\s*(?:sh|bash|zsh)/i, desc: 'Curl piped to shell', indicator: 'REMOTE_CODE_EXEC' },
+    { pattern: /wget\s+[^\s|]{1,500}\s*\|\s*(?:sh|bash|zsh)/i, desc: 'Wget piped to shell', indicator: 'REMOTE_CODE_EXEC' },
+    { pattern: /curl\s+[^\s]{1,500}>\s*[^|&\s]+\s*&&\s*(?:sh|bash|chmod)/i, desc: 'Curl download & exec', indicator: 'REMOTE_CODE_EXEC' },
+    { pattern: /curl\s+[^\s]{0,200}githubusercontent\.com\/[^\s|]{1,300}\|\s*(?:sh|bash|zsh)/i, desc: 'Pipe raw GitHub content to shell', indicator: 'REMOTE_CODE_EXEC' },
+    { pattern: /wget\s+[^\s]{0,200}raw\.githubusercontent\.com\/[^\s|]{1,300}\|\s*(?:sh|bash|zsh)/i, desc: 'Pipe raw GitHub content to shell', indicator: 'REMOTE_CODE_EXEC' },
+    { pattern: /\b(?:b64|base64)\b[^|]{0,100}\|\s*(?:sh|bash)/i, desc: 'Decode then execute via shell', indicator: 'REMOTE_CODE_EXEC' },
+    { pattern: /base64\s+(?:-d|--decode)/i, desc: 'Base64 decoding', indicator: 'OBFUSCATION' },
+    { pattern: /\beval\s*\(/, desc: 'Eval statement', indicator: 'CODE_INJECTION' },
+    { pattern: /setup_bun/i, desc: 'Shai-Hulud Loader', indicator: 'SHAI_HULUD' },
+    { pattern: /bun_environment/i, desc: 'Shai-Hulud Payload', indicator: 'SHAI_HULUD' },
+    { pattern: /SHA1HULUD/i, desc: 'Shai-Hulud Signature', indicator: 'SHAI_HULUD' },
+    { pattern: /node\s+-e\s+["']require\s*\(\s*["']child_process["']\s*\)/, desc: 'Hidden child_process', indicator: 'CODE_INJECTION' },
+    { pattern: /child_process[^)]{0,50}exec[^)]{0,50}\$\(/, desc: 'Shell command via child_process', indicator: 'CODE_INJECTION' },
+    { pattern: /\$\(curl/i, desc: 'Subshell curl', indicator: 'REMOTE_CODE_EXEC' },
+    { pattern: /`curl/i, desc: 'Backtick curl', indicator: 'REMOTE_CODE_EXEC' },
+    { pattern: /bash\s+-c\s+["'][^"']{0,200}curl/i, desc: 'bash -c curl', indicator: 'REMOTE_CODE_EXEC' },
+    { pattern: /curl\s+[^\s]{1,300}-o\s+\S+\s*&&\s*(?:sh|bash|chmod)/i, desc: 'curl save & exec', indicator: 'REMOTE_CODE_EXEC' },
+    { pattern: /wget\s+[^\s]{1,300}-O\s+\S+\s*&&\s*(?:sh|bash|chmod)/i, desc: 'wget save & exec', indicator: 'REMOTE_CODE_EXEC' },
+    { pattern: /require\s*\(\s*["']child_process["']\s*\)\.\s*(?:exec|execSync|spawn|spawnSync)/i, desc: 'Direct child_process call', indicator: 'CODE_INJECTION' },
+    { pattern: /\b(?:execSync|spawnSync|execFileSync)\s*\(/, desc: 'Sync process execution', indicator: 'CODE_INJECTION' },
+    { pattern: /\.github\/workflows\/discussion\.ya?ml/i, desc: 'GitHub workflow backdoor', indicator: 'PERSISTENCE' },
+    { pattern: /docker\s+run\s+[^\n]{0,200}--privileged/i, desc: 'Privileged Docker run', indicator: 'PRIV_ESC' },
+    { pattern: /-v\s+\/:\/host\b/i, desc: 'Host mount in container', indicator: 'PRIV_ESC' }
+];
+
 class Finding {
     constructor(technique, description, severity, evidence, file) {
         this.technique = technique;
@@ -55,7 +83,7 @@ class Finding {
         this.severity = severity;
         this.evidence = evidence;
         this.file = file;
-        const multipliers = { "CRITICAL": 4, "HIGH": 2, "MEDIUM": 1, "LOW": 0.5 };
+        const multipliers = { "CRITICAL": 4, "HIGH": 2, "MEDIUM": 1, "LOW": 0.5, "WARNING": 0.05 };
         this.score = (MITRE_ATTACK[technique]?.baseScore || 1) * (multipliers[severity] || 1);
     }
 }
@@ -153,23 +181,6 @@ function parsePnpmLock(projectPath) {
 }
 
 /** 
- * Parses dependencies from package.json as a fallback.
- * @param {string} pkgJsonPath Path to package.json.
- * @returns {Set<string>} A Set of local dependencies.
- */
-function parsePackageJson(pkgJsonPath) {
-    log.warn("No lockfile found. Falling back to package.json (will miss transitive dependencies).");
-    log.info("Scanning package.json...");
-    const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8'));
-    const packages = new Set();
-    const allDeps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}) };
-    for (const [name, version] of Object.entries(allDeps)) {
-        packages.add(`${name}@${version.replace(/[\^~]/g, '')}`);
-    }
-    return packages;
-}
-
-/** 
  * Extracts all dependencies from a package-lock.json file.
  * Supports v1/v2 (npm 6) and v2/v3 (npm 7+) formats.
  * @param {string} lockfilePath - Path to the package-lock.json.
@@ -255,33 +266,7 @@ function getLocalPackages(lockfilePath) {
 function getPackagesFromNodeModules(projectRoot, compromisedNames) {
     log.info("Performing deep scan of node_modules to find all installed packages...");
     const packages = new Set();
-    const nodeModulesPath = path.join(projectRoot, 'node_modules');
-
-    if (!fs.existsSync(nodeModulesPath)) {
-        return packages;
-    }
-
-    const directories = fs.readdirSync(nodeModulesPath, { withFileTypes: true });
-
-    for (const dir of directories) {
-        const dirPath = path.join(nodeModulesPath, dir.name);
-        const isScoped = dir.name.startsWith('@');
-
-        if (isScoped) { // Scoped package
-            if (!fs.existsSync(dirPath)) continue;
-            const scopedDirs = fs.readdirSync(dirPath);
-            for (const scopedDir of scopedDirs) {
-                const fullPackageName = `${dir.name}/${scopedDir}`;
-                if (compromisedNames.has(fullPackageName)) {
-                    packages.add(`${fullPackageName}@ (directory found without package.json)`);
-                }
-                const pkgJsonPath = path.join(dirPath, scopedDir, 'package.json');
-                addPackage(pkgJsonPath, packages);
-            }
-        } else { // Regular package
-            checkDirectory(dir.name, dirPath, packages);
-        }
-    }
+    const initialNodeModulesPath = path.join(projectRoot, 'node_modules');
 
     function addPackage(pkgJsonPath, packageSet) {
         if (fs.existsSync(pkgJsonPath)) {
@@ -289,29 +274,62 @@ function getPackagesFromNodeModules(projectRoot, compromisedNames) {
                 const pkg = JSON.parse(fs.readFileSync(pkgJsonPath, 'utf-8'));
                 if (pkg.name && pkg.version) {
                     packageSet.add(`${pkg.name}@${pkg.version}`);
+                    return true;
                 }
             } catch (e) { /* Ignore parsing errors */ }
         }
+        return false;
     }
 
-    function checkDirectory(name, fullPath, packageSet) {
-        if (compromisedNames.has(name)) {
+    function scanDir(nodeModulesPath) {
+        if (!fs.existsSync(nodeModulesPath)) return;
+
+        const directories = fs.readdirSync(nodeModulesPath, { withFileTypes: true });
+
+        for (const dir of directories) {
+            const dirPath = path.join(nodeModulesPath, dir.name);
+            if (dir.name.startsWith('.')) continue; // Skip hidden dirs like .bin
+
+            if (dir.name.startsWith('@')) { // Scoped package
+                if (!fs.existsSync(dirPath) || !fs.statSync(dirPath).isDirectory()) continue;
+                const scopedDirs = fs.readdirSync(dirPath);
+                for (const scopedDir of scopedDirs) {
+                    const fullPackageName = `${dir.name}/${scopedDir}`;
+                    const packagePath = path.join(dirPath, scopedDir);
+                    checkPackageDir(fullPackageName, packagePath, packages);
+                }
+            } else { // Regular package
+                checkPackageDir(dir.name, dirPath, packages);
+            }
+        }
+    }
+
+    function checkPackageDir(name, fullPath, packageSet) {
+        const pkgJsonPath = path.join(fullPath, 'package.json');
+        if (!addPackage(pkgJsonPath, packageSet) && compromisedNames.has(name)) {
             packageSet.add(`${name}@ (directory found without package.json)`);
         }
-        const pkgJsonPath = path.join(fullPath, 'package.json');
-        addPackage(pkgJsonPath, packageSet);
+        // Recurse into nested node_modules
+        const nestedNodeModules = path.join(fullPath, 'node_modules');
+        if (fs.existsSync(nestedNodeModules)) {
+            scanDir(nestedNodeModules);
+        }
     }
+
+    scanDir(initialNodeModulesPath);
     return packages;
 }
 /**
- * Recursively finds all files in a directory, ignoring node_modules, .git, and binary-like extensions.
  * @param {string} directory - The directory to scan.
  * @returns {string[]} A list of file paths.
  */
 function getAllFiles(directory) {
     const filesToScan = [];
-    const ignoredDirs = new Set(['node_modules', '.git', '.angular', '.next', '.nuxt', 'dist', 'build', 'coverage']);
-    const ignoredExtensions = new Set(['.md', '.d.ts', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.woff', '.woff2', '.eot', '.ttf', '.ico']);
+    // Optimized filtering: Ignore common non-source directories. node_modules is scanned separately.
+    const ignoredDirs = new Set(['.git', '.angular', '.next', '.nuxt', 'dist', 'build', 'coverage', 'test', '__tests__', 'examples', 'docs']);
+    
+    // Extensions to ignore directly
+    const ignoredExtensions = new Set(['.md', '.map', '.d.ts', '.png', '.jpg', '.jpeg', '.gif', '.svg', '.woff', '.woff2', '.eot', '.ttf', '.ico']);
 
     function findFiles(dir) {
         let entries;
@@ -328,14 +346,23 @@ function getAllFiles(directory) {
                     findFiles(fullPath);
                 }
             } else if (entry.isFile()) {
-                filesToScan.push(fullPath);
+                const ext = path.extname(entry.name).toLowerCase();
+                
+                // Filter: Ignore .json except package.json
+                if (ext === '.json' && entry.name !== 'package.json') {
+                    continue;
+                }
+
+                if (!ignoredExtensions.has(ext)) {
+                    filesToScan.push(fullPath);
+                }
             }
         }
     }
 
     findFiles(directory);
 
-    return filesToScan.filter(file => !ignoredExtensions.has(path.extname(file)));
+    return filesToScan;
 }
 
 /**
@@ -350,6 +377,7 @@ function scanProjectFiles(allFiles, projectRoot, iocs) {
 
     const findings = [];
     const pkgJsonFiles = allFiles.filter(f => path.basename(f) === 'package.json');
+    const commandRegex = new RegExp(iocs.maliciousCommands.join('|').replace(/%/g, '%').replace(/\*/g, '\\*'), 'i');
 
     // Scan for postinstall hooks in package.json files
     log.info("Checking for package.json hooks...");
@@ -360,11 +388,15 @@ function scanProjectFiles(allFiles, projectRoot, iocs) {
 
             // Check for postinstall hooks
             if (pkg.scripts) {
-                const hooks = ['preinstall', 'install', 'postinstall', 'prepare'];
+                const hooks = ['preinstall', 'install', 'postinstall', 'prepublish', 'prepare', 'preuninstall', 'postuninstall'];
                 hooks.forEach(hook => {
                     if (pkg.scripts[hook]) {
+                        // Only check hooks in root package.json here. node_modules are handled in scanNodeModulesForFiles
+                        // Add a low-severity finding for any lifecycle hook to aid in correlation.
                         findings.push(new Finding("T1064", `Lifecycle Hook Detected (${hook})`, "LOW", `Script: ${pkg.scripts[hook]}`, path.relative(projectRoot, file)));
-                        // Check for suspicious commands inside the hook
+                        if (!file.includes('node_modules') && commandRegex.test(pkg.scripts[hook])) {
+                            findings.push(new Finding("T1195", `Malicious Command in Hook (${hook})`, "CRITICAL", `Script: ${pkg.scripts[hook]}`, path.relative(projectRoot, file)));
+                        }
                     }
                 });
             }
@@ -388,7 +420,8 @@ function scanProjectFiles(allFiles, projectRoot, iocs) {
             const hex = hashSum.digest('hex');
 
             if (iocs.maliciousHashes.has(hex)) {
-                findings.push(new Finding("T1195", "Known Malicious File Hash", "CRITICAL", `Hash: ${hex}`, path.relative(projectRoot, file)));
+                const severity = file.includes('node_modules') ? "WARNING" : "CRITICAL";
+                findings.push(new Finding("T1195", "Known Malicious File Hash", severity, `Hash: ${hex}`, path.relative(projectRoot, file)));
             }
 
             // 2. Check filename
@@ -399,31 +432,47 @@ function scanProjectFiles(allFiles, projectRoot, iocs) {
             // 3. Behavioral Analysis (Text files)
             if (file.endsWith('.js') || file.endsWith('.ts') || file.endsWith('.json') || file.endsWith('.sh') || file.endsWith('.yml')) {
                 const content = fileBuffer.toString('utf-8');
+                const isInNodeModules = file.includes('node_modules');
                 
                 // T1552: Unsecured Credentials
-                if (/\bprocess\.env\b/.test(content) || envRegex.test(content)) {
+                // Ignore config files where process.env is common/expected
+                const isConfigFile = /config\.(js|ts|mjs|cjs)$/i.test(file);
+                if (!isInNodeModules && (/\bprocess\.env\b/.test(content) || envRegex.test(content)) && !isConfigFile) {
                     findings.push(new Finding("T1552", "Access to Environment Variables", "LOW", "Pattern: process.env or similar", path.relative(projectRoot, file)));
                 }
 
                 // T1518: Software Discovery (CI/Runners)
-                if (/\bGITHUB_ACTIONS\b|\bCI\b|\bGITLAB_CI\b/.test(content)) {
+                if (!isInNodeModules && (/\bGITHUB_ACTIONS\b|\bCI\b|\bGITLAB_CI\b/.test(content))) {
                     findings.push(new Finding("T1518", "CI Environment Discovery", "LOW", "Pattern: CI/GITHUB_ACTIONS", path.relative(projectRoot, file)));
                 }
 
                 // T1082: System Information Discovery
-                if (/\bos\.platform\(\)|\bos\.userInfo\(\)|\bhomedir\(\)/.test(content)) {
+                if (!isInNodeModules && (/\bos\.platform\(\)|\bos\.userInfo\(\)|\bhomedir\(\)/.test(content))) {
                     findings.push(new Finding("T1082", "System Information Discovery", "LOW", "Pattern: os.platform/userInfo", path.relative(projectRoot, file)));
                 }
 
                 // T1059: Command Execution
-                if (/\bchild_process\b|\bexec\s*\(|\bspawn\s*\(|\bexecSync\s*\(/.test(content)) {
+                if (!isInNodeModules && (/\bchild_process\b|\bexec\s*\(|\bspawn\s*\(|\bexecSync\s*\(/.test(content))) {
                     findings.push(new Finding("T1059", "Process Execution", "MEDIUM", "Pattern: child_process/exec", path.relative(projectRoot, file)));
                 }
 
                 // T1053: Persistence via Workflows
-                if (file.includes('.github/workflows')) {
+                if (!isInNodeModules && file.includes('.github/workflows')) {
                     if (/run:.*npm publish/.test(content) || /run:.*git push/.test(content)) {
                         findings.push(new Finding("T1098", "Suspicious Workflow Action", "HIGH", "Pattern: npm publish/git push in workflow", path.relative(projectRoot, file)));
+                    }
+                }
+
+                // Advanced Pattern Matching (CRITICAL_PATTERNS)
+                for (const check of CRITICAL_PATTERNS) {
+                    if (check.pattern.test(content)) {
+                        let technique = "T1059"; // Default: Command Execution
+                        if (check.indicator === 'OBFUSCATION') technique = "T1027";
+                        if (check.indicator === 'SHAI_HULUD') technique = "T1195";
+                        if (check.indicator === 'PERSISTENCE') technique = "T1098";
+                        if (check.indicator === 'PRIV_ESC') technique = "T1548";
+                        const severity = isInNodeModules ? "WARNING" : "CRITICAL";
+                        findings.push(new Finding(technique, check.desc, severity, `Pattern match: ${check.desc}`, path.relative(projectRoot, file)));
                     }
                 }
             }
@@ -471,8 +520,40 @@ function scanNodeModulesForFiles(nodeModulesPath, projectRoot, iocs) {
                     // Inspect package.json inside node_modules for malicious commands
                     try {
                         const content = fs.readFileSync(fullPath, 'utf-8');
-                        if (commandRegex.test(content)) {
-                            findings.push(new Finding("T1195", "Malicious Command in Dependency", "CRITICAL", "Pattern match in package.json", path.relative(projectRoot, fullPath)));
+                        const pkg = JSON.parse(content);
+                        if (pkg.scripts) {
+                            // Specific Shai-Hulud checks in preinstall
+                            if (pkg.scripts.preinstall) {
+                                const referencedMaliciousFile = Array.from(iocs.maliciousFilenames).find(f => pkg.scripts.preinstall.includes(f));
+                                if (referencedMaliciousFile) {
+                                    findings.push(new Finding("T1195", "Shai-Hulud Malware Installer", "CRITICAL", `Reference to known malicious file '${referencedMaliciousFile}' in preinstall: ${pkg.scripts.preinstall}`, path.relative(projectRoot, fullPath)));
+                                } else if (/\bbun\s+/.test(pkg.scripts.preinstall)) {
+                                    findings.push(new Finding("T1195", "Suspicious 'bun' execution in preinstall", "HIGH", `Script uses bun unexpectedly: ${pkg.scripts.preinstall}`, path.relative(projectRoot, fullPath)));
+                                } else if (/(\\x[0-9a-fA-F]{2}){4,}|eval\s*\(/.test(pkg.scripts.preinstall)) {
+                                    findings.push(new Finding("T1027", "Obfuscated Script in preinstall", "HIGH", `Potential obfuscation detected`, path.relative(projectRoot, fullPath)));
+                                }
+                            }
+                            // General malicious command check
+                            Object.values(pkg.scripts).forEach(script => {
+                                if (commandRegex.test(script)) {
+                                    findings.push(new Finding("T1195", "Malicious Command in Dependency", "WARNING", `Pattern match: ${script}`, path.relative(projectRoot, fullPath)));
+                                }
+                            });
+
+                            // Check for compromised packages listed as dependencies
+                            const allDeps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}), ...(pkg.peerDependencies || {}) };
+                            Object.entries(allDeps).forEach(([depName, depVersion]) => {
+                                // Simple version cleaning. This is a best-effort check.
+                                const cleanedVersion = depVersion.replace(/[\^~>=<]/g, '');
+                                const depIdentifier = `${depName}@${cleanedVersion}`;
+                                
+                                if (iocs.compromisedPackages.has(depIdentifier)) {
+                                    const evidence = `Package '${pkg.name}@${pkg.version}' lists a compromised dependency: '${depIdentifier}'`;
+                                    findings.push(new Finding(
+                                        "T1195", "Compromised Dependency in node_modules", "CRITICAL", evidence, path.relative(projectRoot, fullPath)
+                                    ));
+                                }
+                            });
                         }
                     } catch (e) { /* ignore read errors */ }
                 }
@@ -526,20 +607,45 @@ async function runDependencyAnalysis(projectRoot, compromisedPackagesWithVersion
     }
 
     let localPackages = new Set();
+    let lockfileFound = false;
+
+    // Always parse package.json for top-level dependencies.
+    // This is crucial for catching malicious packages added to package.json before `npm install` is run.
+    try {
+        const pkg = JSON.parse(fs.readFileSync(pkgFile, 'utf-8'));
+        const allDeps = { ...(pkg.dependencies || {}), ...(pkg.devDependencies || {}), ...(pkg.peerDependencies || {}) };
+        log.info("Scanning package.json for declared dependencies...");
+        for (const [name, version] of Object.entries(allDeps)) {
+            // This is a simple version cleaner. It won't resolve complex ranges but is essential for this check.
+            localPackages.add(`${name}@${version.replace(/[\^~>=<]/g, '')}`);
+        }
+    } catch (e) {
+        log.warn(`Could not parse ${pkgFile}. Skipping manifest analysis.`);
+    }
+
+    // Now, parse the lockfile for the full dependency tree if it exists. The Set will handle duplicates.
     if (fs.existsSync(pnpmLockFile) && commandExists('pnpm')) {
-        localPackages = parsePnpmLock(projectRoot);
+        lockfileFound = true;
+        const pnpmPkgs = parsePnpmLock(projectRoot);
+        pnpmPkgs.forEach(pkg => localPackages.add(pkg));
     } else if (fs.existsSync(yarnLockFile) && commandExists('yarn')) {
         // Simple check for Yarn v1. Modern yarn doesn't use `yarn list` in the same way.
         const yarnVersion = execSync('yarn --version', { encoding: 'utf8' });
         if (yarnVersion.startsWith('1.')) {
-            localPackages = getLocalPackages(yarnLockFile);
+            lockfileFound = true;
+            const yarnPkgs = getLocalPackages(yarnLockFile);
+            yarnPkgs.forEach(pkg => localPackages.add(pkg));
         } else {
-            log.warn("Modern Yarn (v2+) detected. This script's dependency analysis for Yarn currently only supports v1. Skipping.");
+            log.warn("Modern Yarn (v2+) detected. Lockfile analysis for Yarn v1 only. Relying on package.json.");
         }
     } else if (fs.existsSync(npmLockFile)) {
-        localPackages = getLocalPackages(npmLockFile);
-    } else {
-        localPackages = parsePackageJson(pkgFile);
+        lockfileFound = true;
+        const npmPkgs = getLocalPackages(npmLockFile);
+        npmPkgs.forEach(pkg => localPackages.add(pkg));
+    }
+
+    if (!lockfileFound) {
+        log.warn("No lockfile found. Analysis is based on package.json and may miss transitive dependencies.");
     }
 
     // Create a set of just the names for directory matching
@@ -548,28 +654,46 @@ async function runDependencyAnalysis(projectRoot, compromisedPackagesWithVersion
         return lastAt > 0 ? pkg.substring(0, lastAt) : pkg.split('@')[0];
     }));
 
-    // Perform a deep scan of node_modules to catch packages not in lockfiles
-    const directScanPackages = getPackagesFromNodeModules(projectRoot, compromisedPackageNames);
-    directScanPackages.forEach(pkg => localPackages.add(pkg));
-
-
-    if (localPackages.size === 0) {
-        log.warn("Could not determine local packages. Skipping version check.");
-        return [];
-    }
-
-    log.info("Checking for vulnerable versions...");
+    // Perform a deep scan of node_modules to verify installed versions
+    const installedPackages = getPackagesFromNodeModules(projectRoot, compromisedPackageNames);
     const findings = [];
-    for (const localPkg of localPackages) {
-        if (compromisedPackagesWithVersions.has(localPkg) || localPkg.includes('(directory found without package.json)')) {
-            let evidence = `Package: ${localPkg}\n    IOC Source: ${IOC_URLS.COMPROMISED_LIBS}`;
-            const lastAt = localPkg.lastIndexOf('@');
-            if (lastAt > 0) {
-                const name = localPkg.substring(0, lastAt);
-                const localPath = path.join(projectRoot, 'node_modules', name);
-                evidence += `\n    Path: ${localPath}`;
+    const reportedPackages = new Set(); // Track reported packages to avoid duplicates
+
+    // Priority: Check installed packages in node_modules
+    if (installedPackages.size > 0) {
+        log.info(`Verifying ${installedPackages.size} installed packages against compromised list...`);
+        for (const localPkg of installedPackages) {
+            const isMissingPkgJson = localPkg.includes('(directory found without package.json)');
+            
+            if (compromisedPackagesWithVersions.has(localPkg)) {
+                reportedPackages.add(localPkg); // Mark this exact version as reported
+                // Exact match of Name + Version in node_modules/package.json
+                let evidence = `Package: ${localPkg}\n    IOC Source: ${IOC_URLS.COMPROMISED_LIBS}`;
+                const lastAt = localPkg.lastIndexOf('@');
+                if (lastAt > 0) {
+                    const name = localPkg.substring(0, lastAt);
+                    const localPath = path.join(projectRoot, 'node_modules', name, 'package.json');
+                    evidence += `\n    File: ${localPath}`;
+                }
+                findings.push(new Finding("T1195", "Compromised Package Version", "CRITICAL", evidence, "node_modules"));
+            } else if (isMissingPkgJson) {
+                findings.push(new Finding("T1195", "Suspicious Package Directory (Compromised Name)", "CRITICAL", `Directory with compromised name found: ${localPkg}. The package version could not be verified.`, "node_modules"));
             }
-            findings.push(new Finding("T1195", "Compromised Package Version", "CRITICAL", evidence, "package.json/lockfile"));
+        }
+    } else if (localPackages.size > 0) {
+        // Fallback: Check lockfiles/manifests if node_modules is missing
+        log.warn("node_modules not scanned. Falling back to lockfile/manifest analysis.");
+    }
+    // Fallback: Check lockfiles/manifests for packages not already reported from node_modules
+    if (localPackages.size > 0) {
+        log.info("Verifying packages from lockfile/manifest...");
+        for (const localPkg of localPackages) {
+            if (reportedPackages.has(localPkg)) {
+                continue; // Already reported with CRITICAL severity from node_modules
+            }
+            if (compromisedPackagesWithVersions.has(localPkg)) {
+                findings.push(new Finding("T1195", "Compromised Package Version in Manifest", "CRITICAL", `Package: ${localPkg}\n    Source: Lockfile/Manifest (Not installed or verified on disk)`, "package.json/lockfile"));
+            }
         }
     }
     log.info("Dependency analysis complete.");
@@ -584,14 +708,27 @@ function calculateRisk(findings) {
     let totalScore = 0;
     const techniquesDetected = new Set();
     const tacticsDetected = new Set();
+    let hasCritical = false;
+    let hasHigh = false;
+    let hasShaiHuludIndicator = false;
 
+    // Check for high-confidence indicators and calculate score from actionable findings.
     findings.forEach(f => {
+        // Check for specific, high-confidence Shai-Hulud indicators in the finding's text.
+        if (/shai-hulud|trufflehog|setup_bun|bun_environment/i.test(f.description) || /shai-hulud|trufflehog|setup_bun|bun_environment/i.test(f.evidence)) {
+            hasShaiHuludIndicator = true;
+        }
+
+        // Ignore LOW and WARNING for scoring and technique correlation.
+        if (f.severity === 'WARNING' || f.severity === 'LOW') return;
+
         totalScore += f.score;
         techniquesDetected.add(f.technique);
         tacticsDetected.add(f.tactic);
+        if (f.severity === 'CRITICAL') hasCritical = true;
+        if (f.severity === 'HIGH') hasHigh = true;
     });
 
-    // --- Correlation Logic ---
     const hasScripting = techniquesDetected.has("T1064"); // Lifecycle hooks
     const hasCredAccess = techniquesDetected.has("T1552"); // process.env
     const hasDiscovery = techniquesDetected.has("T1518") || techniquesDetected.has("T1082"); // CI or Sys info
@@ -601,10 +738,10 @@ function calculateRisk(findings) {
     let correlationBonus = 0;
 
     // Rule: T1064 + T1552 + T1518 -> High probability of Shai Hulud
-    if (hasScripting && hasCredAccess && hasDiscovery) {
+    // A specific indicator like trufflehog is a stronger signal than the behavioral pattern.
+    if (hasShaiHuludIndicator || (hasScripting && hasCredAccess && hasDiscovery)) {
         correlationBonus += 50;
         suspectedFamily = "Shai-Hulud (High Confidence)";
-        findings.push(new Finding("CORRELATION", "Behavioral Pattern Match: Shai-Hulud", "CRITICAL", "Combination of Install Script + Env Access + CI Discovery", "Multiple Sources"));
     } else if (hasScripting && hasExecution) {
         correlationBonus += 20;
         suspectedFamily = "Generic Malware Loader";
@@ -616,6 +753,11 @@ function calculateRisk(findings) {
     if (totalScore > 80) verdict = "CRITICAL";
     else if (totalScore > 40) verdict = "HIGH";
     else if (totalScore > 15) verdict = "MEDIUM";
+
+    // Safety Cap: Prevent CRITICAL verdict if no actual CRITICAL findings exist
+    if (verdict === "CRITICAL" && !hasCritical) {
+        verdict = hasHigh ? "HIGH" : "MEDIUM";
+    }
 
     return { totalScore, verdict, suspectedFamily, techniques: Array.from(techniquesDetected) };
 }
@@ -703,10 +845,11 @@ async function main() {
         console.log(`${colors.BOLD}Suspected Family:${colors.RESET} ${riskAssessment.suspectedFamily}`);
         console.log(`${colors.BOLD}MITRE Techniques:${colors.RESET} ${riskAssessment.techniques.join(', ')}\n`);
 
-        if (allFindings.length > 0) {
+        const visibleFindings = allFindings.filter(f => f.severity !== 'WARNING' && f.severity !== 'LOW');
+        if (visibleFindings.length > 0) {
             console.log(`${colors.BOLD}Detailed Findings:${colors.RESET}`);
-            allFindings.sort((a, b) => b.score - a.score).forEach(f => {
-                const color = f.severity === 'CRITICAL' ? colors.RED : f.severity === 'HIGH' ? colors.RED : f.severity === 'MEDIUM' ? colors.YELLOW : colors.BLUE;
+            visibleFindings.sort((a, b) => b.score - a.score).forEach(f => {
+                const color = (f.severity === 'CRITICAL' || f.severity === 'HIGH') ? colors.RED : (f.severity === 'MEDIUM' || f.severity === 'WARNING') ? colors.YELLOW : colors.BLUE;
                 console.log(`[${color}${f.severity}${colors.RESET}] ${colors.BOLD}${f.technique} - ${f.name}${colors.RESET}`);
                 console.log(`    File: ${f.file}`);
                 console.log(`    Evidence: ${f.evidence}`);
