@@ -6,13 +6,41 @@ This tool helps developers identify potential compromises by scanning for signat
 
 URL: [hulud-party-scanner](https://www.npmjs.com/package/hulud-party-scanner) 
 
+---
 
-It is a **Node.js implementation** inspired by the original shell script from  
-[sngular/shai-hulud-integrity-scanner](https://github.com/sngular/shai-hulud-integrity-scanner), extended with deeper static analysis and heuristic detection.
+## 🛠 Usage
+
+The scanner supports two modes:
+
+- **Light scan** (default): fast, low-overhead, manifest-based
+- **Deep scan** (`--deep`): exhaustive filesystem and dependency analysis
 
 ---
 
-## 🚀 Features
+### ⚡ Light Scan (Default)
+**What it does:**
+- Analyzes `package.json` for declared dependencies.
+- Parses lockfiles (`package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`) to analyze the full dependency tree.
+- Compares declared and transitive dependencies against a list of known compromised packages.
+- Inspects lifecycle hooks in all found `package.json` files for malicious commands.
+
+**What it does *not* do:**
+- ❌ Does **not** scan the `node_modules` directory
+
+> ⚠️ Light mode relies on manifests and lockfiles only.  
+> For full verification of installed dependencies, use `--deep`.
+
+```bash
+# Scan current directory
+npx hulud-party-scanner
+
+# Scan a specific project
+npx hulud-party-scanner "path_to_local_project"
+```
+
+---
+
+## � Features
 
 - **Pattern Detection**: Scans for known malicious filenames, hashes, and code patterns.
 - **Heuristic Analysis**: Detects suspicious behaviors commonly used in supply-chain attacks.
