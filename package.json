@@ -1,6 +1,6 @@
 {
   "name": "hulud-party-scanner",
-  "version": "1.4.0",
+  "version": "1.5.0",
   "bin": {
     "hulud-party-scanner": "./scan.js"
   },
