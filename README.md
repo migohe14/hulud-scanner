@@ -32,10 +32,10 @@ The scanner supports two modes:
 
 ```bash
 # Scan current directory
-npx hulud-party-scanner
+npx hulud-party-scanner@latest
 
 # Scan a specific project
-npx hulud-party-scanner "path_to_local_project"
+npx hulud-party-scanner@latest "path_to_local_project"
 ```
 
 ---
