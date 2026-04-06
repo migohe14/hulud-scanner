@@ -4,6 +4,9 @@
 
 This tool helps developers identify potential compromises by scanning for signatures, behaviors, and indicators associated with the Shai-Hulud supply-chain attack.
 
+URL: [hulud-party-scanner](https://www.npmjs.com/package/hulud-party-scanner) 
+
+
 It is a **Node.js implementation** inspired by the original shell script from  
 [sngular/shai-hulud-integrity-scanner](https://github.com/sngular/shai-hulud-integrity-scanner), extended with deeper static analysis and heuristic detection.
 

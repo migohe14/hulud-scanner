@@ -7,7 +7,12 @@
   "description": "Project integrity scanner for known vulnerabilities and suspicious patterns related to the Shai-Hulud supply-chain attack.",
   "main": "scan.js",
   "scripts": {
-    "scan": "node scan.js"
+    "scan": "node scan.js",
+    "test": "node tests/test-compromised-libs-parser.js && node tests/test-risk-calculation.js && node tests/test-critical-patterns.js && node tests/test-finding-class.js",
+    "test:compromised-libs": "node tests/test-compromised-libs-parser.js",
+    "test:risk": "node tests/test-risk-calculation.js",
+    "test:patterns": "node tests/test-critical-patterns.js",
+    "test:finding": "node tests/test-finding-class.js"
   },
   "author": "miguel.sngular",
   "license": "ISC",

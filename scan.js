@@ -15,6 +15,16 @@ const IOC_URLS = {
     MALICIOUS_HASHES: "https://raw.githubusercontent.com/migohe14/hulud-scanner/refs/heads/main/malicious-hashes.txt"
 };
 
+// Local IOC fallback files (bundled with the scanner)
+const LOCAL_IOC_FILES = {
+    COMPROMISED_LIBS: path.join(__dirname, 'compromised-libs.txt'),
+    ENV_PATTERNS: path.join(__dirname, 'env-patterns.txt'),
+    EXFIL_PATTERNS: path.join(__dirname, 'exfil-patterns.txt'),
+    MALICIOUS_COMMANDS: path.join(__dirname, 'malicious-commands.txt'),
+    MALICIOUS_FILENAMES: path.join(__dirname, 'malicious-filenames.txt'),
+    MALICIOUS_HASHES: path.join(__dirname, 'malicious-hashes.txt')
+};
+
 // --- MITRE ATT&CK & Scoring Configuration ---
 const MITRE_ATTACK = {
     "T1064": { name: "Scripting", tactic: "Execution", baseScore: 5 },
@@ -125,6 +135,23 @@ async function fetchRemoteList(url) {
             });
         }).on('error', (err) => reject(err));
     });
+}
+
+/**
+ * Reads a local IOC file and returns non-empty, non-comment lines.
+ * @param {string} filePath Path to the local file.
+ * @returns {string[]} Parsed lines, or empty array if file not found.
+ */
+function readLocalList(filePath) {
+    try {
+        const data = fs.readFileSync(filePath, 'utf-8');
+        return data
+            .split('\n')
+            .map(line => line.trim())
+            .filter(line => line && !line.startsWith('#'));
+    } catch (e) {
+        return [];
+    }
 }
 
 /**
@@ -834,13 +861,30 @@ async function main() {
             envPatterns // May be undefined in light mode
         ] = await Promise.all(iocPromises);
 
+        // Merge local IOC files with remote data (local entries supplement remote)
+        const localCompromised = readLocalList(LOCAL_IOC_FILES.COMPROMISED_LIBS);
+        const localCommands = readLocalList(LOCAL_IOC_FILES.MALICIOUS_COMMANDS);
+        const mergedCompromised = [...new Set([...compromisedLibsLines, ...localCompromised])];
+        const mergedCommands = [...new Set([...(maliciousCommands || []), ...localCommands])];
+
+        let mergedHashes = maliciousHashes || [];
+        let mergedFilenames = maliciousFilenames || [];
+        let mergedExfil = exfilPatterns || [];
+        let mergedEnv = envPatterns || [];
+        if (isDeepScan) {
+            mergedHashes = [...new Set([...mergedHashes, ...readLocalList(LOCAL_IOC_FILES.MALICIOUS_HASHES)])];
+            mergedFilenames = [...new Set([...mergedFilenames, ...readLocalList(LOCAL_IOC_FILES.MALICIOUS_FILENAMES)])];
+            mergedExfil = [...new Set([...mergedExfil, ...readLocalList(LOCAL_IOC_FILES.EXFIL_PATTERNS)])];
+            mergedEnv = [...new Set([...mergedEnv, ...readLocalList(LOCAL_IOC_FILES.ENV_PATTERNS)])];
+        }
+
         const iocs = {
-            maliciousHashes: new Set(maliciousHashes || []),
-            maliciousFilenames: new Set(maliciousFilenames || []),
-            maliciousCommands: maliciousCommands || [],
-            exfilPatterns: exfilPatterns || [],
-            envPatterns: envPatterns || [],
-            compromisedPackages: new Set(parseCompromisedLibs(compromisedLibsLines))
+            maliciousHashes: new Set(mergedHashes),
+            maliciousFilenames: new Set(mergedFilenames),
+            maliciousCommands: mergedCommands,
+            exfilPatterns: mergedExfil,
+            envPatterns: mergedEnv,
+            compromisedPackages: new Set(parseCompromisedLibs(mergedCompromised))
         };
 
         log.info(`Loaded IOCs: ${iocs.compromisedPackages.size} compromised pkgs, ${iocs.maliciousHashes.size} hashes, ${iocs.maliciousFilenames.size} filenames.`);
@@ -911,4 +955,14 @@ async function main() {
     }
 }
 
-main();
+if (require.main === module) {
+    main();
+}
+
+module.exports = {
+    parseCompromisedLibs,
+    calculateRisk,
+    Finding,
+    MITRE_ATTACK,
+    CRITICAL_PATTERNS,
+};
